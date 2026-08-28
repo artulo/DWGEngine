@@ -13,6 +13,8 @@
 #include "dwg_text.h"
 #include "dwg_solid.h"
 #include "dwg_insert.h"
+#include "dwg_leader.h"
+#include "dwg_linetype.h"
 #include "dwg_transform.h"
 
 #ifndef M_PI
@@ -33,6 +35,10 @@
 #define DWG_R2000_TYPE_POINT      0x1B
 #define DWG_R2000_TYPE_SOLID      0x1F
 #define DWG_R2000_TYPE_MTEXT      0x2C
+#define DWG_R2000_TYPE_ELLIPSE     0x1A
+#define DWG_R2000_TYPE_LEADER      0x26
+#define DWG_R2000_TYPE_LTYPE       0x36
+#define DWG_R2000_TYPE_HATCH       0x4E
 
 #define DWG_R2000_TYPE_BLOCK_HEADER 0x31
 #define DWG_R2000_TYPE_LAYER  0x33
@@ -65,6 +71,12 @@
    never returned). */
 #define DWG_R2000_MAX_REACTORS 1000UL
 
+/* Safety bound on LEADER vertex count (BL, 32-bit, no inherent limit)
+   -- a stale/garbage object-map entry can decode as LEADER with a
+   garbage num_vertex up to 4 billion.  Same rationale as MAX_REACTORS
+   and MAX_VERTICES. */
+#define DWG_R2000_MAX_LEADER_VERTICES 100000UL
+
 typedef struct
 {
     unsigned long obj_size_bits;
@@ -76,6 +88,19 @@ typedef struct
     unsigned long ltflags;
     unsigned long plotstyleflags;
 } DWG_R2000_COMMON_ENTITY;
+
+/* Forward declarations for functions called from
+   decode_and_transform_block_entity but defined later in this file. */
+static HENTITY decode_text(HDWG hDwg, DWG_BITSTREAM *bs);
+static HENTITY decode_mtext(HDWG hDwg, DWG_BITSTREAM *bs);
+static HENTITY decode_polyline2d(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long ms_end_bit,
+                                  const DWG_R2000_COMMON_ENTITY *common,
+                                  const unsigned char *data, unsigned long length,
+                                  const DWG_R2000_OBJMAP *objmap);
+static HENTITY decode_polyline3d(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long ms_end_bit,
+                                  const DWG_R2000_COMMON_ENTITY *common,
+                                  const unsigned char *data, unsigned long length,
+                                  const DWG_R2000_OBJMAP *objmap);
 
 /*
  * Extended Entity Data (spec chapter 28): a chain of
@@ -152,11 +177,18 @@ static int read_common_entity_data(DWG_BITSTREAM *bs, DWG_R2000_COMMON_ENTITY *o
     if (preview_exists != 0UL)
     {
         unsigned long preview_size = dwg_bs_read_rl(bs);
-        if (preview_size > 0x7FFFFFFFUL) /* defensive: RL is unsigned, a
-                                             corrupt/negative-looking value
-                                             would seek wildly out of range */
+        unsigned long cur_bit, preview_bits;
+        /* preview_size * 8 overflows unsigned long on 32-bit when
+           preview_size > 0x1FFFFFFF -- clamp to something that fits
+           a real DWG preview (a few MB at most) and also won't
+           overflow.  100 MB is way more than any real preview. */
+        if (preview_size > 100000000UL)
             return 0;
-        dwg_bs_seek_bit(bs, dwg_bs_tell_bit(bs) + preview_size * 8UL);
+        preview_bits = preview_size * 8UL;
+        cur_bit = dwg_bs_tell_bit(bs);
+        if (cur_bit + preview_bits < cur_bit) /* additional overflow guard */
+            return 0;
+        dwg_bs_seek_bit(bs, cur_bit + preview_bits);
     }
 
     out->entmode = dwg_bs_read_bb(bs);
@@ -258,6 +290,163 @@ static int read_entity_style_handle(DWG_BITSTREAM *bs, unsigned long ms_end_bit,
     dwg_bs_read_handle(bs, &code, style_handle); /* STYLE */
 
     return 1;
+}
+
+/* Read the LTYPE handle from the common entity handle stream. Returns 1
+   and fills *ltype_handle on success. */
+static int read_entity_ltype_handle(DWG_BITSTREAM *bs, unsigned long ms_end_bit,
+                                    const DWG_R2000_COMMON_ENTITY *common,
+                                    unsigned long *ltype_handle)
+{
+    unsigned long i;
+    unsigned char code;
+    unsigned long value;
+
+    dwg_bs_seek_bit(bs, ms_end_bit + common->obj_size_bits);
+
+    if (common->entmode == 0UL)
+        dwg_bs_read_handle(bs, &code, &value);
+
+    for (i = 0UL; i < common->numreactors; i++)
+        dwg_bs_read_handle(bs, &code, &value);
+
+    dwg_bs_read_handle(bs, &code, &value); /* xdicobjhandle */
+
+    if (common->nolinks == 0UL)
+    {
+        dwg_bs_read_handle(bs, &code, &value); /* previous entity */
+        dwg_bs_read_handle(bs, &code, &value); /* next entity */
+    }
+
+    dwg_bs_read_handle(bs, &code, &value); /* LAYER */
+
+    if (common->ltflags == 3UL)
+    {
+        dwg_bs_read_handle(bs, &code, ltype_handle); /* LTYPE */
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Decode a full STYLE table record from the object map, extracting not
+   just the name (which decode_table_record_name already does) but also
+   font_file, big_font_file, height, width_factor, and oblique. Creates
+   and returns a HSTYLE in the document, or NULL on failure. */
+static HSTYLE decode_style_record(HDWG hDwg,
+                                  const unsigned char *data, unsigned long length,
+                                  unsigned long loc)
+{
+    DWG_BITSTREAM bs;
+    unsigned short obj_type;
+    unsigned short eed_size;
+    unsigned char handle_code;
+    unsigned long handle_value;
+    unsigned short flags;
+    double fixed_height, width_factor, oblique;
+    unsigned short generation_flags;
+    char font_file[DWG_STYLE_FONT_MAX];
+    char big_font[DWG_STYLE_FONT_MAX];
+    char name[DWG_STYLE_NAME_MAX];
+    HSTYLE style;
+
+    dwg_bs_init(&bs, data, length);
+    dwg_bs_seek_bit(&bs, loc * 8UL);
+
+    (void)dwg_bs_read_ms(&bs);
+    obj_type = dwg_bs_read_bs(&bs);
+    if (obj_type != DWG_R2000_TYPE_STYLE)
+        return NULL;
+
+    (void)dwg_bs_read_rl(&bs);
+    dwg_bs_read_handle(&bs, &handle_code, &handle_value);
+
+    eed_size = dwg_bs_read_bs(&bs);
+    if (eed_size != 0U)
+        skip_eed_blocks(&bs, eed_size);
+
+    (void)dwg_bs_read_bl(&bs); /* numreactors */
+
+    (void)dwg_bs_read_t(&bs, name, (unsigned short)sizeof(name));
+    if (name[0] == '\0')
+        return NULL;
+
+    style = dwg_document_add_style(hDwg, name);
+    if (style == NULL)
+        return NULL;
+
+    flags = dwg_bs_read_bs(&bs);
+    fixed_height = dwg_bs_read_bd(&bs);
+    width_factor = dwg_bs_read_bd(&bs);
+    oblique = dwg_bs_read_bd(&bs);
+    generation_flags = dwg_bs_read_bs(&bs);
+    (void)dwg_bs_read_t(&bs, big_font, (unsigned short)sizeof(big_font));
+    (void)dwg_bs_read_t(&bs, font_file, (unsigned short)sizeof(font_file));
+
+    if (fixed_height != 0.0)
+        dwg_style_set_height(style, fixed_height);
+    if (width_factor != 0.0)
+        dwg_style_set_width_factor(style, width_factor);
+    if (oblique != 0.0)
+        dwg_style_set_oblique(style, oblique);
+    if (generation_flags & 0x04)
+        dwg_style_set_backward(style, DWG_TRUE);
+    if (generation_flags & 0x08)
+        dwg_style_set_upside_down(style, DWG_TRUE);
+
+    if (font_file[0] != '\0')
+        dwg_style_set_font(style, font_file);
+    if (big_font[0] != '\0')
+        dwg_style_set_ttf_name(style, big_font);
+
+    return style;
+}
+
+/* Decode an LTYPE table record, extracting name and description. Creates
+   and returns a HLINETYPE in the document, or NULL on failure. */
+static HLINETYPE decode_ltype_record(HDWG hDwg,
+                                     const unsigned char *data, unsigned long length,
+                                     unsigned long loc)
+{
+    DWG_BITSTREAM bs;
+    unsigned short obj_type;
+    unsigned short eed_size;
+    unsigned char handle_code;
+    unsigned long handle_value;
+    char name[DWG_LINETYPE_NAME_MAX];
+    char description[DWG_LINETYPE_DESCR_MAX];
+    HLINETYPE lt;
+
+    dwg_bs_init(&bs, data, length);
+    dwg_bs_seek_bit(&bs, loc * 8UL);
+
+    (void)dwg_bs_read_ms(&bs);
+    obj_type = dwg_bs_read_bs(&bs);
+    if (obj_type != DWG_R2000_TYPE_LTYPE)
+        return NULL;
+
+    (void)dwg_bs_read_rl(&bs);
+    dwg_bs_read_handle(&bs, &handle_code, &handle_value);
+
+    eed_size = dwg_bs_read_bs(&bs);
+    if (eed_size != 0U)
+        skip_eed_blocks(&bs, eed_size);
+
+    (void)dwg_bs_read_bl(&bs); /* numreactors */
+
+    (void)dwg_bs_read_t(&bs, name, (unsigned short)sizeof(name));
+    if (name[0] == '\0')
+        return NULL;
+
+    lt = dwg_document_add_linetype(hDwg, name);
+    if (lt == NULL)
+        return NULL;
+
+    (void)dwg_bs_read_t(&bs, description, (unsigned short)sizeof(description));
+    if (description[0] != '\0')
+        dwg_linetype_set_descr(lt, description);
+
+    return lt;
 }
 
 /* Same idea again, but for INSERT's BLOCK HEADER handle -- which sits
@@ -534,6 +723,81 @@ static HENTITY decode_arc(HDWG hDwg, DWG_BITSTREAM *bs)
                        start_angle_rad * 180.0 / M_PI, end_angle_rad * 180.0 / M_PI);
 }
 
+static HENTITY decode_ellipse(HDWG hDwg, DWG_BITSTREAM *bs)
+{
+    DWG_POINT3D center, major_axis;
+    double axis_ratio, start_param, end_param;
+
+    dwg_bs_read_3bd(bs, &center);
+    dwg_bs_read_3bd(bs, &major_axis);
+    axis_ratio = dwg_bs_read_bd(bs);
+    start_param = dwg_bs_read_bd(bs);
+    end_param = dwg_bs_read_bd(bs);
+
+    if (!is_plausible_coord(center.x) || !is_plausible_coord(center.y) || !is_plausible_coord(center.z) ||
+        !is_plausible_coord(major_axis.x) || !is_plausible_coord(major_axis.y) || !is_plausible_coord(major_axis.z))
+        return NULL;
+
+    return dwg_add_ellipse(hDwg, center.x, center.y, center.z,
+                           major_axis.x, major_axis.y, major_axis.z,
+                           axis_ratio, start_param, end_param);
+}
+
+static HENTITY decode_leader(HDWG hDwg, DWG_BITSTREAM *bs)
+{
+    unsigned char class_version;
+    double arrow_size;
+    unsigned short path_type, creation_type;
+    unsigned char annot_handle_code;
+    unsigned long annot_handle_value;
+    unsigned long num_vertex, i;
+    HENTITY e;
+
+    class_version = dwg_bs_read_rc(bs);
+    arrow_size = dwg_bs_read_bd(bs);
+    path_type = dwg_bs_read_bs(bs);
+    creation_type = dwg_bs_read_bs(bs);
+    (void)path_type; (void)creation_type;
+
+    dwg_bs_read_handle(bs, &annot_handle_code, &annot_handle_value);
+
+    num_vertex = dwg_bs_read_bl(bs);
+    if (num_vertex > DWG_R2000_MAX_LEADER_VERTICES)
+        num_vertex = DWG_R2000_MAX_LEADER_VERTICES;
+
+    e = dwg_add_leader(hDwg);
+    if (e == NULL)
+        return NULL;
+
+    dwg_leader_set_arrow_size(e, arrow_size);
+
+    for (i = 0UL; i < num_vertex; i++)
+    {
+        DWG_POINT3D pt;
+        dwg_bs_read_3bd(bs, &pt);
+        if (!is_plausible_coord(pt.x) || !is_plausible_coord(pt.y) || !is_plausible_coord(pt.z))
+        {
+            /* garbage vertex from a stale object-map entry -- discard
+               the entire leader rather than mixing good and bad verts */
+            dwg_entity_destroy(e);
+            return NULL;
+        }
+        dwg_leader_add_vertex(e, pt.x, pt.y, pt.z);
+    }
+
+    {
+        DWG_POINT3D extrusion;
+        dwg_bs_read_be(bs, &extrusion);
+    }
+    {
+        DWG_POINT3D xto_dir;
+        dwg_bs_read_3bd(bs, &xto_dir);
+    }
+    (void)dwg_bs_read_bs(bs);
+
+    return e;
+}
+
 static HENTITY decode_point(HDWG hDwg, DWG_BITSTREAM *bs)
 {
     DWG_POINT3D p;
@@ -749,6 +1013,7 @@ static int decode_and_transform_block_entity(HDWG hDwg, const unsigned char *dat
                                               double ins_x, double ins_y, double ins_z,
                                               double scale_x, double scale_y, double scale_z,
                                               double rotation_deg,
+                                              const DWG_R2000_OBJMAP *objmap,
                                               unsigned long *next_handle)
 {
     DWG_BITSTREAM bs;
@@ -764,22 +1029,37 @@ static int decode_and_transform_block_entity(HDWG hDwg, const unsigned char *dat
     ms_end_bit = dwg_bs_tell_bit(&bs);
     obj_type = dwg_bs_read_bs(&bs);
 
-    if (obj_type != DWG_R2000_TYPE_LINE && obj_type != DWG_R2000_TYPE_CIRCLE &&
-        obj_type != DWG_R2000_TYPE_ARC && obj_type != DWG_R2000_TYPE_POINT &&
-        obj_type != DWG_R2000_TYPE_SOLID)
-        return 0;
-
     if (!read_common_entity_data(&bs, &common))
         return 0;
+
+    if (obj_type != DWG_R2000_TYPE_LINE && obj_type != DWG_R2000_TYPE_CIRCLE &&
+        obj_type != DWG_R2000_TYPE_ARC && obj_type != DWG_R2000_TYPE_POINT &&
+        obj_type != DWG_R2000_TYPE_SOLID && obj_type != DWG_R2000_TYPE_ELLIPSE &&
+        obj_type != DWG_R2000_TYPE_LEADER && obj_type != DWG_R2000_TYPE_TEXT &&
+        obj_type != DWG_R2000_TYPE_MTEXT && obj_type != DWG_R2000_TYPE_POLYLINE2D &&
+        obj_type != DWG_R2000_TYPE_POLYLINE3D &&
+        obj_type != DWG_R2000_TYPE_INSERT && obj_type != DWG_R2000_TYPE_HATCH)
+    {
+        *next_handle = find_entity_next_handle(&bs, ms_end_bit, &common, cur_handle);
+        return 1;
+    }
 
     switch (obj_type)
     {
     case DWG_R2000_TYPE_LINE:   e = decode_line(hDwg, &bs);   break;
     case DWG_R2000_TYPE_CIRCLE: e = decode_circle(hDwg, &bs); break;
     case DWG_R2000_TYPE_ARC:    e = decode_arc(hDwg, &bs);    break;
+    case DWG_R2000_TYPE_ELLIPSE: e = decode_ellipse(hDwg, &bs); break;
     case DWG_R2000_TYPE_POINT:  e = decode_point(hDwg, &bs);  break;
     case DWG_R2000_TYPE_SOLID:  e = decode_solid(hDwg, &bs);  break;
-    default: break;
+    case DWG_R2000_TYPE_LEADER: e = decode_leader(hDwg, &bs); break;
+    case DWG_R2000_TYPE_TEXT:    e = decode_text(hDwg, &bs);   break;
+    case DWG_R2000_TYPE_MTEXT:   e = decode_mtext(hDwg, &bs);  break;
+    case DWG_R2000_TYPE_POLYLINE2D: e = decode_polyline2d(hDwg, &bs, ms_end_bit, &common, data, length, objmap); break;
+    case DWG_R2000_TYPE_POLYLINE3D: e = decode_polyline3d(hDwg, &bs, ms_end_bit, &common, data, length, objmap); break;
+    case DWG_R2000_TYPE_INSERT: /* nested INSERT in block: skip, main loop handles it */ break;
+    case DWG_R2000_TYPE_HATCH:  /* HATCH in block: skip */ break;
+    default: fprintf(stderr, "[BLOCK] unhandled type 0x%02X in block chain\n", obj_type); break;
     }
 
     *next_handle = find_entity_next_handle(&bs, ms_end_bit, &common, cur_handle);
@@ -900,8 +1180,8 @@ static HENTITY decode_insert(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long ms_end_
                 break;
 
             if (!decode_and_transform_block_entity(hDwg, data, length, eloc, cur, &block_base_pt,
-                                                   ins.x, ins.y, ins.z, sx, sy, sz,
-                                                   rotation_rad * 180.0 / M_PI, &next))
+                                                    ins.x, ins.y, ins.z, sx, sy, sz,
+                                                    rotation_rad * 180.0 / M_PI, objmap, &next))
                 break;
 
             if (reached_last)
@@ -1430,44 +1710,7 @@ static HENTITY decode_polyline3d(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long ms_
     return e;
 }
 
-static unsigned char *read_whole_file(const char *path, unsigned long *out_length)
-{
-    FILE *fp;
-    long size;
-    unsigned char *buf;
-
-    fp = fopen(path, "rb");
-    if (fp == NULL)
-        return NULL;
-
-    fseek(fp, 0, SEEK_END);
-    size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (size < 0)
-    {
-        fclose(fp);
-        return NULL;
-    }
-
-    buf = (unsigned char *)malloc((size_t)size);
-    if (buf == NULL)
-    {
-        fclose(fp);
-        return NULL;
-    }
-
-    if (fread(buf, 1, (size_t)size, fp) != (size_t)size)
-    {
-        free(buf);
-        fclose(fp);
-        return NULL;
-    }
-
-    fclose(fp);
-    *out_length = (unsigned long)size;
-    return buf;
-}
+/* read_whole_file removed -- use dwg_read_whole_file from dwg_file_io.c */
 
 HDWG dwg_read_dwg_r2000(const char *path, DWG_IO_RESULT *result)
 {
@@ -1488,7 +1731,7 @@ HDWG dwg_read_dwg_r2000(const char *path, DWG_IO_RESULT *result)
         return NULL;
     }
 
-    data = read_whole_file(path, &length);
+    data = dwg_read_whole_file(path, &length);
     if (data == NULL)
     {
         if (result != NULL) *result = DWG_IO_ERROR_OPEN;
@@ -1597,6 +1840,7 @@ HDWG dwg_read_dwg_r2000(const char *path, DWG_IO_RESULT *result)
         case DWG_R2000_TYPE_LINE:   e = decode_line(hDwg, &bs);   break;
         case DWG_R2000_TYPE_CIRCLE: e = decode_circle(hDwg, &bs); break;
         case DWG_R2000_TYPE_ARC:    e = decode_arc(hDwg, &bs);    break;
+        case DWG_R2000_TYPE_ELLIPSE: e = decode_ellipse(hDwg, &bs); break;
         case DWG_R2000_TYPE_POINT:  e = decode_point(hDwg, &bs);  break;
         case DWG_R2000_TYPE_SOLID:  e = decode_solid(hDwg, &bs);  break;
         case DWG_R2000_TYPE_INSERT:
@@ -1610,6 +1854,7 @@ HDWG dwg_read_dwg_r2000(const char *path, DWG_IO_RESULT *result)
             break;
         case DWG_R2000_TYPE_MTEXT: e = decode_mtext(hDwg, &bs); break;
         case DWG_R2000_TYPE_TEXT:  e = decode_text(hDwg, &bs);  break;
+        case DWG_R2000_TYPE_LEADER: e = decode_leader(hDwg, &bs); break;
         default: break; /* not modeled yet: skip via the object map, no need to know its length */
         }
 
@@ -1648,16 +1893,47 @@ HDWG dwg_read_dwg_r2000(const char *path, DWG_IO_RESULT *result)
         if (obj_type == DWG_R2000_TYPE_MTEXT || obj_type == DWG_R2000_TYPE_TEXT)
         {
             unsigned long style_handle, style_loc;
-            char style_name[DWG_R2000_MAX_STYLE_NAME];
 
             if (read_entity_style_handle(&bs, ms_end_bit, &common, &style_handle) &&
-                objmap_find(&objmap, style_handle, &style_loc) &&
-                decode_table_record_name(data, length, style_loc, DWG_R2000_TYPE_STYLE, style_name, sizeof(style_name), NULL))
+                objmap_find(&objmap, style_handle, &style_loc))
             {
+                HSTYLE existing = NULL;
+                char style_name_tmp[DWG_R2000_MAX_STYLE_NAME];
+
+                /* Decode the full STYLE record to populate font info in the
+                   document's style table -- but only once per unique style. */
+                if (decode_table_record_name(data, length, style_loc, DWG_R2000_TYPE_STYLE,
+                                             style_name_tmp, sizeof(style_name_tmp), NULL))
+                {
+                    existing = dwg_document_get_style(hDwg, style_name_tmp);
+                    if (existing == NULL)
+                        decode_style_record(hDwg, data, length, style_loc);
+                }
+
                 if (obj_type == DWG_R2000_TYPE_MTEXT)
-                    dwg_mtext_set_style_name(e, style_name);
+                    dwg_mtext_set_style_name(e, style_name_tmp);
                 else
-                    dwg_text_set_style_name(e, style_name);
+                    dwg_text_set_style_name(e, style_name_tmp);
+            }
+        }
+
+        /* Resolve LTYPE handle: create DWG_LINETYPE in the document so
+           the renderer and DXF writer can look it up by name. */
+        {
+            unsigned long ltype_handle;
+            if (read_entity_ltype_handle(&bs, ms_end_bit, &common, &ltype_handle))
+            {
+                unsigned long ltype_loc;
+                if (objmap_find(&objmap, ltype_handle, &ltype_loc))
+                {
+                    char lt_name[DWG_LINETYPE_NAME_MAX];
+                    if (decode_table_record_name(data, length, ltype_loc, DWG_R2000_TYPE_LTYPE,
+                                                 lt_name, sizeof(lt_name), NULL))
+                    {
+                        if (dwg_document_get_linetype(hDwg, lt_name) == NULL)
+                            decode_ltype_record(hDwg, data, length, ltype_loc);
+                    }
+                }
             }
         }
     }

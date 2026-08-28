@@ -123,7 +123,10 @@ void dwg_entity_move(HENTITY hEntity, double dx, double dy, double dz)
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(hEntity);
-        HVERTEX v = dwg_polyline_first_vertex(pl);
+        HVERTEX v;
+        if (pl == NULL)
+            break;
+        v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -251,7 +254,10 @@ void dwg_entity_rotate(HENTITY hEntity,
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(hEntity);
-        HVERTEX v = dwg_polyline_first_vertex(pl);
+        HVERTEX v;
+        if (pl == NULL)
+            break;
+        v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -395,7 +401,10 @@ static void entity_scale_xyz(HENTITY hEntity,
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(hEntity);
-        HVERTEX v = dwg_polyline_first_vertex(pl);
+        HVERTEX v;
+        if (pl == NULL)
+            break;
+        v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -548,7 +557,10 @@ void dwg_entity_mirror(HENTITY hEntity,
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(hEntity);
-        HVERTEX v = dwg_polyline_first_vertex(pl);
+        HVERTEX v;
+        if (pl == NULL)
+            break;
+        v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -994,7 +1006,10 @@ static void apply_insert_transform(HENTITY e, double sx, double sy, double sz,
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(e);
-        HVERTEX v = dwg_polyline_first_vertex(pl);
+        HVERTEX v;
+        if (pl == NULL)
+            break;
+        v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;

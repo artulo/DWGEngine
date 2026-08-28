@@ -13,6 +13,8 @@
 #include "dwg_solid.h"
 #include "dwg_insert.h"
 #include "dwg_hatch.h"
+#include "dwg_leader.h"
+#include "dwg_style.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -26,6 +28,7 @@
 typedef struct
 {
     HDC hdc;
+    HDWG hDwg;
     double scale;
     double origin_x, origin_y;
     HPEN pen;
@@ -279,30 +282,120 @@ static void draw_point(const DWG_RENDER_CTX *rc, HENTITY e)
 static void draw_polyline(const DWG_RENDER_CTX *rc, HENTITY e)
 {
     HPOLYLINE pl = dwg_polyline_from_entity(e);
-    HVERTEX v, first;
-    double prev_x = 0.0, prev_y = 0.0;
+    HVERTEX v;
+    double prev_x = 0.0, prev_y = 0.0, prev_bulge = 0.0;
     int have_prev = 0;
     double fx = 0.0, fy = 0.0;
     if (pl == NULL) return;
 
     for (v = dwg_polyline_first_vertex(pl); v != NULL; v = dwg_polyline_next_vertex(v))
     {
-        double x, y, z;
+        double x, y, z, bulge;
         dwg_vertex_get_point(v, &x, &y, &z);
+        bulge = dwg_vertex_get_bulge(v);
+
         if (have_prev)
-            draw_segment(rc, prev_x, prev_y, x, y);
+        {
+            if (prev_bulge != 0.0)
+            {
+                /* Tessellate the arc segment between prev and current vertex.
+                   bulge = tan(included_angle/4), same convention as HATCH. */
+                double dx = x - prev_x;
+                double dy = y - prev_y;
+                double chord = sqrt(dx * dx + dy * dy);
+                if (chord > 1.0e-9)
+                {
+                    double included = 4.0 * atan(prev_bulge);
+                    double sagitta = (chord / 2.0) * prev_bulge;
+                    double perp_x = -dy / chord;
+                    double perp_y = dx / chord;
+                    double mid_x = (prev_x + x) / 2.0;
+                    double mid_y = (prev_y + y) / 2.0;
+                    double radius = chord / (2.0 * fabs(sin(included / 2.0)));
+                    double cx = mid_x + perp_x * (radius - sagitta);
+                    double cy = mid_y + perp_y * (radius - sagitta);
+                    double start_angle = atan2(prev_y - cy, prev_x - cx);
+                    double end_angle = atan2(y - cy, x - cx);
+                    double sweep = end_angle - start_angle;
+                    unsigned long n, s;
+
+                    if (prev_bulge > 0.0) { while (sweep <= 0.0) sweep += 2.0 * M_PI; }
+                    else                  { while (sweep >= 0.0) sweep -= 2.0 * M_PI; }
+
+                    n = segment_count_for_sweep(sweep);
+                    for (s = 1UL; s <= n; s++)
+                    {
+                        double a = start_angle + sweep * ((double)s / (double)n);
+                        double ax = cx + radius * cos(a);
+                        double ay = cy + radius * sin(a);
+                        draw_segment(rc, prev_x, prev_y, ax, ay);
+                        prev_x = ax; prev_y = ay;
+                    }
+                }
+                else
+                {
+                    draw_segment(rc, prev_x, prev_y, x, y);
+                }
+            }
+            else
+            {
+                draw_segment(rc, prev_x, prev_y, x, y);
+            }
+        }
         else
         {
             fx = x; fy = y;
         }
         prev_x = x; prev_y = y;
+        prev_bulge = bulge;
         have_prev = 1;
     }
     if (dwg_polyline_is_closed(pl) && have_prev)
-        draw_segment(rc, prev_x, prev_y, fx, fy);
+    {
+        if (prev_bulge != 0.0)
+        {
+            double dx = fx - prev_x;
+            double dy = fy - prev_y;
+            double chord = sqrt(dx * dx + dy * dy);
+            if (chord > 1.0e-9)
+            {
+                double included = 4.0 * atan(prev_bulge);
+                double sagitta = (chord / 2.0) * prev_bulge;
+                double perp_x = -dy / chord;
+                double perp_y = dx / chord;
+                double mid_x = (prev_x + fx) / 2.0;
+                double mid_y = (prev_y + fy) / 2.0;
+                double radius = chord / (2.0 * fabs(sin(included / 2.0)));
+                double cx = mid_x + perp_x * (radius - sagitta);
+                double cy = mid_y + perp_y * (radius - sagitta);
+                double start_angle = atan2(prev_y - cy, prev_x - cx);
+                double end_angle = atan2(fy - cy, fx - cx);
+                double sweep = end_angle - start_angle;
+                unsigned long n, s;
 
-    first = dwg_polyline_first_vertex(pl); /* silence unused-var warning on some paths */
-    (void)first;
+                if (prev_bulge > 0.0) { while (sweep <= 0.0) sweep += 2.0 * M_PI; }
+                else                  { while (sweep >= 0.0) sweep -= 2.0 * M_PI; }
+
+                n = segment_count_for_sweep(sweep);
+                for (s = 1UL; s <= n; s++)
+                {
+                    double a = start_angle + sweep * ((double)s / (double)n);
+                    double ax = cx + radius * cos(a);
+                    double ay = cy + radius * sin(a);
+                    draw_segment(rc, prev_x, prev_y, ax, ay);
+                    prev_x = ax; prev_y = ay;
+                }
+            }
+            else
+            {
+                draw_segment(rc, prev_x, prev_y, fx, fy);
+            }
+        }
+        else
+        {
+            draw_segment(rc, prev_x, prev_y, fx, fy);
+        }
+    }
 }
 
 static void draw_solid(const DWG_RENDER_CTX *rc, HENTITY e)
@@ -443,13 +536,15 @@ static void draw_hatch(const DWG_RENDER_CTX *rc, HENTITY e)
  * ("los numeros se leen pero estan desplazados").
  */
 static void draw_text_string(const DWG_RENDER_CTX *rc, double x, double y, double angle_deg,
-                             double height_world, const char *text, UINT valign, UINT halign)
+                             double height_world, const char *text, UINT valign, UINT halign,
+                             double width_factor, int backward, const char *font_name)
 {
     LONG px, py;
-    LONG height_px;
+    LONG height_px, width_px;
     HFONT hFont, hOldFont;
     int old_bk;
     UINT old_align;
+    const char *face = (font_name != NULL && font_name[0] != '\0') ? font_name : "Arial";
 
     if (text == NULL || text[0] == '\0')
         return;
@@ -458,17 +553,15 @@ static void draw_text_string(const DWG_RENDER_CTX *rc, double x, double y, doubl
     height_px = (LONG)(height_world / rc->scale + 0.5);
     if (height_px < 1) height_px = 1;
 
-    /* NOT YET VISUALLY VERIFIED: GDI's lfEscapement is documented as
-       "counterclockwise from the x-axis" but real-world behavior under
-       a manually Y-flipped mapping (our case -- we compute device
-       pixels ourselves per point, GDI never sees our world coordinate
-       system) is a known source of sign confusion. Passing angle_deg
-       directly here is a reasonable first guess, not a confirmed
-       result -- check real rotated text on screen once the viewer is
-       actually running, and negate here if it spins the wrong way. */
-    hFont = CreateFontA(-height_px, 0, (LONG)(angle_deg * 10.0 + 0.5), (LONG)(angle_deg * 10.0 + 0.5),
+    /* lfWidth: average character width in logical units. Negative = mirrored
+       (backward text). width_factor of 1.0 means standard aspect ratio. */
+    width_px = (LONG)(height_px * width_factor + 0.5);
+    if (backward)
+        width_px = -width_px;
+
+    hFont = CreateFontA(-height_px, width_px, (LONG)(angle_deg * 10.0 + 0.5), (LONG)(angle_deg * 10.0 + 0.5),
                         FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
-                        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
+                        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
     hOldFont = (HFONT)SelectObject(rc->hdc, hFont);
     old_bk = SetBkMode(rc->hdc, TRANSPARENT);
     old_align = SetTextAlign(rc->hdc, valign | halign);
@@ -481,12 +574,125 @@ static void draw_text_string(const DWG_RENDER_CTX *rc, double x, double y, doubl
     DeleteObject(hFont);
 }
 
+/* SHX-to-Windows font name mapping table. Common AutoCAD SHX fonts
+   mapped to their closest Windows GDI equivalents. */
+typedef struct { const char *shx; const char *win; } shx_map_entry;
+static const shx_map_entry shx_map[] = {
+    { "romans.shx",    "RomanS" },
+    { "romand.shx",    "RomanD" },
+    { "romant.shx",    "RomanT" },
+    { "simplex.shx",   "Simplex" },
+    { "complex.shx",   "Complex" },
+    { "hztxt.shx",     "SimSun" },
+    { "hztxtf.shx",    "SimSun" },
+    { "txt.shx",       "Txt" },
+    { "txt64.shx",     "Txt" },
+    { "isoct.shx",     "ISOCPEUR" },
+    { "isoct2.shx",    "ISOCPEUR" },
+    { "isocp.shx",     "ISOCPEUR" },
+    { "isocp1.shx",    "ISOCPEUR" },
+    { "isocp2.shx",    "ISOCPEUR" },
+    { "isocp3.shx",    "ISOCPEUR" },
+    { "isosceur.shx",  "ISOCPEUR" },
+    { "gothic.shx",    "GothicE" },
+    { "gothice.shx",   "GothicE" },
+    { "gothicg.shx",   "GothicG" },
+    { "gothici.shx",   "GothicI" },
+    { "syastro.shx",   "Symbol" },
+    { "symap.shx",     "Symbol" },
+    { "symath.shx",    "Symbol" },
+    { "gdt.shx",       "GDT" },
+    { "gdtext.shx",    "GDT" },
+    { "italic.shx",    "Italic" },
+    { "italicc.shx",   "Italic" },
+    { "italict.shx",   "Italic" },
+    { "monotxt.shx",   "Courier New" },
+    { "monotxt.shx",   "Courier New" },
+    { "cour.shx",      "Courier New" },
+    { "courier.shx",   "Courier New" },
+    { "arial.shx",     "Arial" },
+    { "arial.ttf",     "Arial" },
+    { "times.shx",     "Times New Roman" },
+    { "times.ttf",     "Times New Roman" },
+    { "verdana.shx",   "Verdana" },
+    { "verdana.ttf",   "Verdana" },
+    { "tahoma.shx",    "Tahoma" },
+    { "tahoma.ttf",    "Tahoma" },
+    { NULL, NULL }
+};
+
+/* Map an SHX filename to a Windows GDI face name. Returns the GDI
+   face name if found, otherwise returns the original name unchanged. */
+static const char *shx_to_win_font(const char *name)
+{
+    int i;
+    const char *dot;
+
+    if (name == NULL || name[0] == '\0')
+        return name;
+
+    /* Check if it's an SHX file (ends in .shx or .SHX) */
+    dot = strrchr(name, '.');
+    if (dot != NULL && (strcmp(dot, ".shx") == 0 || strcmp(dot, ".SHX") == 0 ||
+                        strcmp(dot, ".SHX") == 0))
+    {
+        for (i = 0; shx_map[i].shx != NULL; i++)
+        {
+            if (_stricmp(name, shx_map[i].shx) == 0)
+                return shx_map[i].win;
+        }
+        /* Unknown SHX: strip extension and return bare name as last resort */
+    }
+
+    return name;
+}
+
+/* Look up the best Windows font face name for an entity's STYLE.
+   Priority: ttf_name (group 4, usually a real TTF) > font_name (group 3,
+   may be SHX) mapped through shx_to_win_font. Returns the face name
+   string or NULL if nothing usable is found. */
+static const char *resolve_entity_font(const DWG_RENDER_CTX *rc, const char *style_name)
+{
+    HSTYLE style;
+    const char *ttf, *font;
+
+    if (rc->hDwg == NULL || style_name == NULL || style_name[0] == '\0')
+        return NULL;
+
+    style = dwg_document_get_style(rc->hDwg, style_name);
+    if (style == NULL)
+        return NULL;
+
+    /* Prefer TTF name (group 4) -- it's usually a real Windows font */
+    ttf = dwg_style_get_ttf_name(style);
+    if (ttf != NULL && ttf[0] != '\0')
+    {
+        /* Strip .ttf extension if present */
+        const char *dot = strrchr(ttf, '.');
+        if (dot != NULL && (_stricmp(dot, ".ttf") == 0 || _stricmp(dot, ".TTF") == 0))
+        {
+            /* Can't modify in-place, but CreateFontA handles .ttf names too */
+        }
+        return ttf;
+    }
+
+    /* Fall back to primary font (group 3), mapping SHX -> Windows name */
+    font = dwg_style_get_font(style);
+    if (font != NULL && font[0] != '\0')
+        return shx_to_win_font(font);
+
+    return NULL;
+}
+
 static void draw_text(const DWG_RENDER_CTX *rc, HENTITY e)
 {
     double x, y, z;
+    const char *font = resolve_entity_font(rc, dwg_text_get_style_name(e));
     dwg_text_get_point(e, &x, &y, &z);
     draw_text_string(rc, x, y, dwg_text_get_angle(e), dwg_text_get_height(e), dwg_text_get_text(e),
-                     TA_BASELINE, TA_LEFT);
+                     TA_BASELINE, TA_LEFT,
+                     dwg_text_get_width_factor(e),
+                     dwg_text_get_backward(e) ? 1 : 0, font);
 }
 
 /*
@@ -525,7 +731,86 @@ static void draw_mtext(const DWG_RENDER_CTX *rc, HENTITY e)
     default: break; /* top row: anchor as-is */
     }
 
-    draw_text_string(rc, x, y, 0.0, height_world, dwg_mtext_get_text(e), valign, halign);
+    draw_text_string(rc, x, y, dwg_mtext_get_angle(e), height_world, dwg_mtext_get_text(e), valign, halign,
+                     1.0, 0, resolve_entity_font(rc, dwg_mtext_get_style_name(e)));
+}
+
+/*
+ * ELLIPSE: parametric tessellation into line segments.
+ * DWG stores: center, major_axis_endpoint (vector from center to major
+ * axis end), axis_ratio (minor/major), start_param/end_param (radians,
+ * 0..2PI for a full ellipse). The parametric form is:
+ *   P(t) = center + cos(t) * major_axis + sin(t) * axis_ratio * major_axis
+ * where major_axis = (major_axis_endpoint - center).
+ */
+static void draw_ellipse(const DWG_RENDER_CTX *rc, HENTITY e)
+{
+    DWG_ELLIPSE3D *g = (DWG_ELLIPSE3D *)e->geometry;
+    double mx, my, nx, ny;
+    double start, end, sweep;
+    unsigned long n, i;
+    double prev_x, prev_y;
+
+    if (g == NULL) return;
+
+    mx = g->major_axis_endpoint.x - g->center.x;
+    my = g->major_axis_endpoint.y - g->center.y;
+    nx = -my * g->axis_ratio;
+    ny =  mx * g->axis_ratio;
+
+    start = g->start_param;
+    end = g->end_param;
+    sweep = end - start;
+    if (sweep <= 0.0) sweep += 2.0 * M_PI;
+
+    n = segment_count_for_sweep(sweep);
+    prev_x = g->center.x + mx * cos(start) + nx * sin(start);
+    prev_y = g->center.y + my * cos(start) + ny * sin(start);
+
+    for (i = 1UL; i <= n; i++)
+    {
+        double t = start + sweep * ((double)i / (double)n);
+        double px = g->center.x + mx * cos(t) + nx * sin(t);
+        double py = g->center.y + my * cos(t) + ny * sin(t);
+        draw_segment(rc, prev_x, prev_y, px, py);
+        prev_x = px; prev_y = py;
+    }
+}
+
+/* 3DFACE: same geometry as SOLID, drawn as a filled quad. */
+static void draw_face(const DWG_RENDER_CTX *rc, HENTITY e)
+{
+    DWG_FACE3D *g = (DWG_FACE3D *)e->geometry;
+    POINT pts[4];
+    if (g == NULL) return;
+    world_to_pixel(rc, g->p1.x, g->p1.y, &pts[0].x, &pts[0].y);
+    world_to_pixel(rc, g->p2.x, g->p2.y, &pts[1].x, &pts[1].y);
+    world_to_pixel(rc, g->p3.x, g->p3.y, &pts[2].x, &pts[2].y);
+    world_to_pixel(rc, g->p4.x, g->p4.y, &pts[3].x, &pts[3].y);
+    Polygon(rc->hdc, pts, 4);
+}
+
+static void draw_leader(const DWG_RENDER_CTX *rc, HENTITY e)
+{
+    HVERTEX v;
+    double px, py, pz;
+    double prev_x, prev_y;
+    int first = 1;
+
+    for (v = dwg_leader_first_vertex(e); v != NULL; v = dwg_leader_next_vertex(v))
+    {
+        dwg_vertex_get_point(v, &px, &py, &pz);
+        if (first)
+        {
+            prev_x = px; prev_y = py;
+            first = 0;
+        }
+        else
+        {
+            draw_segment(rc, prev_x, prev_y, px, py);
+            prev_x = px; prev_y = py;
+        }
+    }
 }
 
 void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
@@ -548,6 +833,7 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
     DeleteObject(bg_brush);
 
     rc.hdc = hdc;
+    rc.hDwg = hDwg;
     rc.scale = scale;
     rc.origin_x = origin_x;
     rc.origin_y = origin_y;
@@ -582,6 +868,9 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
         case DWG_ENTITY_HATCH:    set_brush_for_color(&rc, color); draw_hatch(&rc, e); break;
         case DWG_ENTITY_TEXT:     draw_text(&rc, e); break;
         case DWG_ENTITY_MTEXT:    draw_mtext(&rc, e); break;
+        case DWG_ENTITY_ELLIPSE:  draw_ellipse(&rc, e); break;
+        case DWG_ENTITY_FACE:     set_brush_for_color(&rc, color); draw_face(&rc, e); break;
+        case DWG_ENTITY_LEADER:   draw_leader(&rc, e); break;
         default: break; /* anything else: not modeled, see dwg_render.h */
         }
     }
@@ -688,6 +977,45 @@ long dwg_render_get_extents(HDWG hDwg, double *min_x, double *min_y,
             DWG_RENDER_EXTEND(x, y);
             break;
         }
+        case DWG_ENTITY_ELLIPSE:
+        {
+            DWG_ELLIPSE3D *g = (DWG_ELLIPSE3D *)e->geometry;
+            if (g != NULL)
+            {
+                /* conservative: bound by the major+minor axes extents */
+                double major_len = sqrt((g->major_axis_endpoint.x - g->center.x) *
+                                        (g->major_axis_endpoint.x - g->center.x) +
+                                        (g->major_axis_endpoint.y - g->center.y) *
+                                        (g->major_axis_endpoint.y - g->center.y));
+                double minor_len = major_len * g->axis_ratio;
+                DWG_RENDER_EXTEND(g->center.x - major_len, g->center.y - major_len);
+                DWG_RENDER_EXTEND(g->center.x + major_len, g->center.y + major_len);
+                DWG_RENDER_EXTEND(g->center.x - minor_len, g->center.y - minor_len);
+                DWG_RENDER_EXTEND(g->center.x + minor_len, g->center.y + minor_len);
+            }
+            break;
+        }
+        case DWG_ENTITY_FACE:
+        {
+            DWG_FACE3D *g = (DWG_FACE3D *)e->geometry;
+            if (g != NULL)
+            {
+                DWG_RENDER_EXTEND(g->p1.x, g->p1.y); DWG_RENDER_EXTEND(g->p2.x, g->p2.y);
+                DWG_RENDER_EXTEND(g->p3.x, g->p3.y); DWG_RENDER_EXTEND(g->p4.x, g->p4.y);
+            }
+            break;
+        }
+        case DWG_ENTITY_LEADER:
+        {
+            HVERTEX v;
+            for (v = dwg_leader_first_vertex(e); v != NULL; v = dwg_leader_next_vertex(v))
+            {
+                double vx, vy, vz;
+                dwg_vertex_get_point(v, &vx, &vy, &vz);
+                DWG_RENDER_EXTEND(vx, vy);
+            }
+            break;
+        }
         default: break;
         }
     }
@@ -695,7 +1023,10 @@ long dwg_render_get_extents(HDWG hDwg, double *min_x, double *min_y,
 #undef DWG_RENDER_EXTEND
 
     if (!have_any)
+    {
+        *min_x = 0.0; *min_y = 0.0; *max_x = 0.0; *max_y = 0.0;
         return 0L;
+    }
 
     *min_x = lo_x; *min_y = lo_y; *max_x = hi_x; *max_y = hi_y;
     return 1L;

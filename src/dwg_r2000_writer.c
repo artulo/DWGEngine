@@ -1087,43 +1087,7 @@ static void style_control_handles(DWG_BW *bw, const void *vctx)
 
 /* ================= template reading helpers (mirrors the reader's own bit-level idioms) ================= */
 
-static unsigned char *read_whole_file(const char *path, unsigned long *out_length)
-{
-    FILE *fp;
-    long size;
-    unsigned char *buf;
-
-    fp = fopen(path, "rb");
-    if (fp == NULL)
-        return NULL;
-
-    fseek(fp, 0, SEEK_END);
-    size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (size < 0)
-    {
-        fclose(fp);
-        return NULL;
-    }
-
-    buf = (unsigned char *)malloc((size_t)size);
-    if (buf == NULL)
-    {
-        fclose(fp);
-        return NULL;
-    }
-
-    if (fread(buf, 1, (size_t)size, fp) != (size_t)size)
-    {
-        fclose(fp);
-        free(buf);
-        return NULL;
-    }
-    fclose(fp);
-
-    *out_length = (unsigned long)size;
-    return buf;
-}
+/* read_whole_file removed -- use dwg_read_whole_file from dwg_file_io.c */
 
 static int objmap_find_w(const DWG_R2000_OBJMAP *objmap, unsigned long handle, unsigned long *loc)
 {
@@ -1738,7 +1702,7 @@ DWG_IO_RESULT dwg_write_dwg_r2000(HDWG hDwg, const char *template_path, const ch
     REGION regions[MAX_REGIONS]; unsigned long n_regions = 0UL;
     unsigned long region_boundaries[MAX_REGIONS]; long region_shifts[MAX_REGIONS];
 
-    data = read_whole_file(template_path, &length);
+    data = dwg_read_whole_file(template_path, &length);
     if (data == NULL)
         return DWG_IO_ERROR_OPEN;
 
@@ -2523,7 +2487,7 @@ DWG_IO_RESULT dwg_write_dwg_r2000(HDWG hDwg, const char *template_path, const ch
         if (section_size_field > 0xFFFFUL)
         {
             bw_free(&section);
-            result = DWG_IO_ERROR_MEMORY;
+            result = DWG_IO_ERROR_FORMAT;
             goto cleanup;
         }
 

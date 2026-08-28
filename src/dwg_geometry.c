@@ -144,6 +144,45 @@ HENTITY dwg_add_arc(HDWG hDwg,
     return entity;
 }
 
+HENTITY dwg_add_ellipse(HDWG hDwg,
+                        double cx, double cy, double cz,
+                        double major_axis_x, double major_axis_y, double major_axis_z,
+                        double axis_ratio,
+                        double start_param,
+                        double end_param)
+{
+    DWG_ELLIPSE3D *ellipse;
+    HENTITY entity;
+
+    if (hDwg == NULL)
+        return NULL;
+
+    entity = dwg_document_add_entity(hDwg, DWG_ENTITY_ELLIPSE);
+    if (entity == NULL)
+        return NULL;
+
+    ellipse = (DWG_ELLIPSE3D *)dwg_alloc_geometry(sizeof(DWG_ELLIPSE3D));
+    if (ellipse == NULL)
+    {
+        dwg_document_remove_entity(hDwg, entity);
+        return NULL;
+    }
+
+    ellipse->center.x = cx;
+    ellipse->center.y = cy;
+    ellipse->center.z = cz;
+    ellipse->major_axis_endpoint.x = major_axis_x;
+    ellipse->major_axis_endpoint.y = major_axis_y;
+    ellipse->major_axis_endpoint.z = major_axis_z;
+    ellipse->axis_ratio = axis_ratio;
+    ellipse->start_param = start_param;
+    ellipse->end_param = end_param;
+
+    entity->geometry = ellipse;
+
+    return entity;
+}
+
 HENTITY dwg_add_polyline(HDWG hDwg)
 {
     HENTITY entity;

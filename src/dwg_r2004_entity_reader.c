@@ -11,6 +11,7 @@
 #include "dwg_solid.h"
 #include "dwg_insert.h"
 #include "dwg_hatch.h"
+#include "dwg_leader.h"
 #include "dwg_vertex.h"
 #include "dwg_transform.h"
 #include "dwg_text.h"
@@ -26,6 +27,7 @@
 
 #define DWG_R2004_MAX_PLAUSIBLE_COORD 1.0e7
 #define DWG_R2004_MAX_REACTORS 1000UL
+#define DWG_R2004_MAX_LEADER_VERTICES 100000UL
 #define DWG_R2004_MAX_SECTIONS 64UL
 #define DWG_R2004_MAX_PAGES 8192UL
 #define DWG_R2004_MAX_PAGES_PER_SECTION 4096UL
@@ -55,44 +57,7 @@ static long rld_at(const unsigned char *data, unsigned long off)
     return (long)rl_at(data, off);
 }
 
-static unsigned char *read_whole_file(const char *path, unsigned long *out_length)
-{
-    FILE *fp;
-    long size;
-    unsigned char *buf;
-
-    fp = fopen(path, "rb");
-    if (fp == NULL)
-        return NULL;
-
-    fseek(fp, 0, SEEK_END);
-    size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (size < 0)
-    {
-        fclose(fp);
-        return NULL;
-    }
-
-    buf = (unsigned char *)malloc((size_t)size);
-    if (buf == NULL)
-    {
-        fclose(fp);
-        return NULL;
-    }
-
-    if (fread(buf, 1, (size_t)size, fp) != (size_t)size)
-    {
-        free(buf);
-        fclose(fp);
-        return NULL;
-    }
-
-    fclose(fp);
-    *out_length = (unsigned long)size;
-    return buf;
-}
+/* read_whole_file removed -- use dwg_read_whole_file from dwg_file_io.c */
 
 /* ---- encrypted file header (0x80..0x80+0x6C), spec 4.3/r2004_file_header.spec ---- */
 
@@ -856,6 +821,63 @@ static long resolve_r2004_layer_name(const unsigned char *data, unsigned long le
     return read_r2004_first_string(data, length, layer_type_start, layer_bitsize, out_name, out_size);
 }
 
+/* Like resolve_r2004_layer_name but resolves the STYLE handle that
+   follows the LAYER handle in TEXT/MTEXT entity handle streams.
+   Handle order in the entity handle stream:
+     ownerhandle (if entmode==0), reactors, xdicobjhandle (if present),
+     LAYER, STYLE (for TEXT/MTEXT). */
+static long resolve_r2004_style_name(const unsigned char *data, unsigned long length,
+                                     const DWG_R2004_HANDLE_ENTRY *handles, unsigned long handle_count,
+                                     unsigned long type_start_bit, unsigned long bitsize,
+                                     const DWG_R2004_COMMON_ENTITY *common,
+                                     char *out_name, unsigned long out_size)
+{
+    DWG_BITSTREAM bs;
+    unsigned char code;
+    unsigned long value, k, layer_handle, style_handle, style_offset, style_type_start;
+    unsigned long style_length, style_hdlstream_size, style_bitsize, style_obj_type;
+
+    if (type_start_bit + bitsize > length * 8UL)
+        return 0L;
+
+    dwg_bs_init(&bs, data, length);
+    dwg_bs_seek_bit(&bs, type_start_bit + bitsize);
+
+    /* Skip ownerhandle, reactors, xdicobjhandle -- same as layer resolver */
+    if (common->entmode == 0UL)
+        dwg_bs_read_handle(&bs, &code, &value); /* ownerhandle */
+    for (k = 0UL; k < common->numreactors; k++)
+        dwg_bs_read_handle(&bs, &code, &value);
+    if (common->xdic_missing == 0UL)
+        dwg_bs_read_handle(&bs, &code, &value); /* xdicobjhandle */
+
+    /* Skip LAYER handle */
+    dwg_bs_read_handle(&bs, &code, &value);
+
+    /* Read STYLE handle (the one after LAYER for TEXT/MTEXT) */
+    dwg_bs_read_handle(&bs, &code, &value);
+    style_handle = dwg_bs_resolve_handle(code, value, common->handle);
+
+    if (!find_handle(handles, handle_count, style_handle, &style_offset))
+        return 0L;
+    if (style_offset + 8UL >= length)
+        return 0L;
+
+    dwg_bs_seek_bit(&bs, style_offset * 8UL);
+    style_length = dwg_bs_read_ms(&bs);
+    if (style_length == 0UL)
+        return 0L;
+
+    style_hdlstream_size = dwg_bs_read_mc(&bs, 0);
+    style_type_start = dwg_bs_tell_bit(&bs);
+    style_obj_type = read_object_type_r2010(&bs);
+    if (style_obj_type != 0x35UL) /* not really a STYLE -- skip */
+        return 0L;
+
+    style_bitsize = style_length * 8UL - style_hdlstream_size;
+    return read_r2004_first_string(data, length, style_type_start, style_bitsize, out_name, out_size);
+}
+
 /* ---- geometry decoders: same field shape as R2000 (R2004+/R2010+ only
    changed Common Entity Data and the Type encoding, not these basic
    entities' own fields) -- confirmed against real, plausible decoded
@@ -866,6 +888,8 @@ static long resolve_r2004_layer_name(const unsigned char *data, unsigned long le
 #define DWG_R2004_TYPE_LINE   0x13UL
 #define DWG_R2004_TYPE_POINT  0x1BUL
 #define DWG_R2004_TYPE_SOLID  0x1FUL
+#define DWG_R2004_TYPE_ELLIPSE  0x46UL
+#define DWG_R2004_TYPE_LEADER   0x30UL
 
 static HENTITY decode_line(HDWG hDwg, DWG_BITSTREAM *bs)
 {
@@ -943,6 +967,79 @@ static HENTITY decode_arc(HDWG hDwg, DWG_BITSTREAM *bs)
 
     return dwg_add_arc(hDwg, center.x, center.y, center.z, radius,
                        start_angle_rad * 180.0 / M_PI, end_angle_rad * 180.0 / M_PI);
+}
+
+static HENTITY decode_ellipse(HDWG hDwg, DWG_BITSTREAM *bs)
+{
+    DWG_POINT3D center, major_axis;
+    double axis_ratio, start_param, end_param;
+
+    dwg_bs_read_3bd(bs, &center);
+    dwg_bs_read_3bd(bs, &major_axis);
+    axis_ratio = dwg_bs_read_bd(bs);
+    start_param = dwg_bs_read_bd(bs);
+    end_param = dwg_bs_read_bd(bs);
+
+    if (!is_plausible_coord(center.x) || !is_plausible_coord(center.y) || !is_plausible_coord(center.z) ||
+        !is_plausible_coord(major_axis.x) || !is_plausible_coord(major_axis.y) || !is_plausible_coord(major_axis.z))
+        return NULL;
+
+    return dwg_add_ellipse(hDwg, center.x, center.y, center.z,
+                           major_axis.x, major_axis.y, major_axis.z,
+                           axis_ratio, start_param, end_param);
+}
+
+static HENTITY decode_leader(HDWG hDwg, DWG_BITSTREAM *bs)
+{
+    unsigned char class_version;
+    double arrow_size;
+    unsigned short path_type, creation_type;
+    unsigned char annot_handle_code;
+    unsigned long annot_handle_value;
+    unsigned long num_vertex, i;
+    HENTITY e;
+
+    class_version = dwg_bs_read_rc(bs);
+    arrow_size = dwg_bs_read_bd(bs);
+    path_type = dwg_bs_read_bs(bs);
+    creation_type = dwg_bs_read_bs(bs);
+    (void)path_type; (void)creation_type;
+
+    dwg_bs_read_handle(bs, &annot_handle_code, &annot_handle_value);
+
+    num_vertex = dwg_bs_read_bl(bs);
+    if (num_vertex > DWG_R2004_MAX_LEADER_VERTICES)
+        num_vertex = DWG_R2004_MAX_LEADER_VERTICES;
+
+    e = dwg_add_leader(hDwg);
+    if (e == NULL)
+        return NULL;
+
+    dwg_leader_set_arrow_size(e, arrow_size);
+
+    for (i = 0UL; i < num_vertex; i++)
+    {
+        DWG_POINT3D pt;
+        dwg_bs_read_3bd(bs, &pt);
+        if (!is_plausible_coord(pt.x) || !is_plausible_coord(pt.y) || !is_plausible_coord(pt.z))
+        {
+            dwg_entity_destroy(e);
+            return NULL;
+        }
+        dwg_leader_add_vertex(e, pt.x, pt.y, pt.z);
+    }
+
+    {
+        DWG_POINT3D extrusion;
+        dwg_bs_read_be(bs, &extrusion);
+    }
+    {
+        DWG_POINT3D xto_dir;
+        dwg_bs_read_3bd(bs, &xto_dir);
+    }
+    (void)dwg_bs_read_bs(bs);
+
+    return e;
 }
 
 static HENTITY decode_point(HDWG hDwg, DWG_BITSTREAM *bs)
@@ -1418,7 +1515,8 @@ static void decode_and_transform_block_entity_r2004(HDWG hDwg, const unsigned ch
     if (obj_type != DWG_R2004_TYPE_LINE && obj_type != DWG_R2004_TYPE_CIRCLE &&
         obj_type != DWG_R2004_TYPE_ARC && obj_type != DWG_R2004_TYPE_POINT &&
         obj_type != DWG_R2004_TYPE_SOLID && obj_type != DWG_R2004_TYPE_TEXT &&
-        obj_type != DWG_R2004_TYPE_MTEXT)
+        obj_type != DWG_R2004_TYPE_MTEXT && obj_type != DWG_R2004_TYPE_ELLIPSE &&
+        obj_type != DWG_R2004_TYPE_LEADER && obj_type != DWG_R2004_TYPE_LWPOLYLINE)
         return;
 
     if (!read_common_entity_r2004(&bs, &common))
@@ -1429,10 +1527,13 @@ static void decode_and_transform_block_entity_r2004(HDWG hDwg, const unsigned ch
     case DWG_R2004_TYPE_LINE:   e = decode_line(hDwg, &bs);   break;
     case DWG_R2004_TYPE_CIRCLE: e = decode_circle(hDwg, &bs); break;
     case DWG_R2004_TYPE_ARC:    e = decode_arc(hDwg, &bs);    break;
+    case DWG_R2004_TYPE_ELLIPSE: e = decode_ellipse(hDwg, &bs); break;
     case DWG_R2004_TYPE_POINT:  e = decode_point(hDwg, &bs);  break;
     case DWG_R2004_TYPE_SOLID:  e = decode_solid(hDwg, &bs);  break;
     case DWG_R2004_TYPE_TEXT:   e = decode_text(hDwg, &bs, data, length, type_start_bit, bitsize);  break;
     case DWG_R2004_TYPE_MTEXT:  e = decode_mtext(hDwg, &bs, data, length, type_start_bit, bitsize); break;
+    case DWG_R2004_TYPE_LEADER: e = decode_leader(hDwg, &bs); break;
+    case DWG_R2004_TYPE_LWPOLYLINE: e = decode_lwpolyline(hDwg, &bs); break;
     default: break;
     }
 
@@ -2506,7 +2607,8 @@ static unsigned long carve_missing_handles(const unsigned char *objects_buf, uns
             obj_type != DWG_R2004_TYPE_DIM_ORDINATE && obj_type != DWG_R2004_TYPE_DIM_LINEAR &&
             obj_type != DWG_R2004_TYPE_DIM_ALIGNED && obj_type != DWG_R2004_TYPE_DIM_ANG3PT &&
             obj_type != DWG_R2004_TYPE_DIM_ANG2LN && obj_type != DWG_R2004_TYPE_DIM_RADIUS &&
-            obj_type != DWG_R2004_TYPE_DIM_DIAMETER && obj_type != DWG_R2004_TYPE_BLOCK_HEADER)
+            obj_type != DWG_R2004_TYPE_DIM_DIAMETER && obj_type != DWG_R2004_TYPE_BLOCK_HEADER &&
+            obj_type != DWG_R2004_TYPE_ELLIPSE && obj_type != DWG_R2004_TYPE_LEADER)
             continue;
 
         dwg_bs_read_handle(&bs, &code, &value); /* an object's own handle is always code 0 (absolute) */
@@ -2574,7 +2676,7 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
         return NULL;
     }
 
-    data = read_whole_file(path, &length);
+    data = dwg_read_whole_file(path, &length);
     if (data == NULL)
     {
         if (result != NULL) *result = DWG_IO_ERROR_OPEN;
@@ -2680,7 +2782,8 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
             obj_type != DWG_R2004_TYPE_DIM_ORDINATE && obj_type != DWG_R2004_TYPE_DIM_LINEAR &&
             obj_type != DWG_R2004_TYPE_DIM_ALIGNED && obj_type != DWG_R2004_TYPE_DIM_ANG3PT &&
             obj_type != DWG_R2004_TYPE_DIM_ANG2LN && obj_type != DWG_R2004_TYPE_DIM_RADIUS &&
-            obj_type != DWG_R2004_TYPE_DIM_DIAMETER)
+            obj_type != DWG_R2004_TYPE_DIM_DIAMETER && obj_type != DWG_R2004_TYPE_ELLIPSE &&
+            obj_type != DWG_R2004_TYPE_LEADER)
             continue;
 
         if (!read_common_entity_r2004(&bs, &common))
@@ -2703,6 +2806,9 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
             case DWG_R2004_TYPE_LINE:   e = decode_line(hDwg, &bs);   break;
             case DWG_R2004_TYPE_CIRCLE: e = decode_circle(hDwg, &bs); break;
             case DWG_R2004_TYPE_ARC:    e = decode_arc(hDwg, &bs);    break;
+            case DWG_R2004_TYPE_ELLIPSE:
+                e = decode_ellipse(hDwg, &bs);
+                break;
             case DWG_R2004_TYPE_POINT:  e = decode_point(hDwg, &bs);  break;
             case DWG_R2004_TYPE_SOLID:  e = decode_solid(hDwg, &bs);  break;
             case DWG_R2004_TYPE_INSERT:
@@ -2725,6 +2831,9 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
             case DWG_R2004_TYPE_LWPOLYLINE:
                 e = decode_lwpolyline(hDwg, &bs);
                 break;
+            case DWG_R2004_TYPE_LEADER:
+                e = decode_leader(hDwg, &bs);
+                break;
             case DWG_R2004_TYPE_DIM_ORDINATE:
             case DWG_R2004_TYPE_DIM_LINEAR:
             case DWG_R2004_TYPE_DIM_ALIGNED:
@@ -2744,6 +2853,23 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
             apply_color(e, common.color);
             if (have_layer)
                 dwg_entity_put_layer(e, layer_name);
+
+            /* Resolve STYLE for TEXT/MTEXT entities */
+            if (obj_type == DWG_R2004_TYPE_TEXT || obj_type == DWG_R2004_TYPE_MTEXT)
+            {
+                char style_name[256];
+                long have_style;
+
+                have_style = resolve_r2004_style_name(objects_buf, sec_objects->total_size, handles, handle_count,
+                                                      type_start_bit, bitsize, &common, style_name, sizeof(style_name));
+                if (have_style && style_name[0] != '\0')
+                {
+                    if (obj_type == DWG_R2004_TYPE_MTEXT)
+                        dwg_mtext_set_style_name(e, style_name);
+                    else
+                        dwg_text_set_style_name(e, style_name);
+                }
+            }
         }
     }
 

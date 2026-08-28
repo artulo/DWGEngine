@@ -40,11 +40,11 @@ set GT=gtgui
 set hdir=%HBDIR%
 set hdirl=%hdir%\lib\win\bcc
 set fwh=%FWDIR%
-set bcdir=d:\prgsmio\bcc770
+if "%bcdir%" == "" set bcdir=d:\prgsmio\bcc770
 
 set PRG=dwg_demo
 set ENG=..
-set ENGABS=D:\estudio\DWGEngine
+if "%ENGABS%" == "" set ENGABS=C:\Users\artur\Documents\GitHub\DWGEngine
 
 REM Borrar .obj viejos -- mismo motivo que en PDFEngine32\win32\Build.bat:
 REM mejor un "no existe" clarito que linkear con un .obj de una vuelta
@@ -89,6 +89,7 @@ set CFLAGS_ENG=-c -O2 -w- -n. -I%ENGABS%\include -I%bcdir%\include
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_dxf_reader.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_dxf_writer.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_entity.c
+%bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_file_io.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_geometry.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_hatch.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_insert.c
@@ -114,11 +115,40 @@ set CFLAGS_ENG=-c -O2 -w- -n. -I%ENGABS%\include -I%bcdir%\include
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_transform.c
 %bcdir%\bin\bcc32 %CFLAGS_ENG% %ENGABS%\src\dwg_vertex.c
 
-if not exist dwg_render.obj goto ENGINEERROR
+if not exist dwg_bitstream.obj goto ENGINEERROR
+if not exist dwg_block.obj goto ENGINEERROR
+if not exist dwg_dimstyle.obj goto ENGINEERROR
+if not exist dwg_document.obj goto ENGINEERROR
+if not exist dwg_dwg_reader.obj goto ENGINEERROR
+if not exist dwg_dwg_writer.obj goto ENGINEERROR
+if not exist dwg_dxf_reader.obj goto ENGINEERROR
+if not exist dwg_dxf_writer.obj goto ENGINEERROR
+if not exist dwg_entity.obj goto ENGINEERROR
+if not exist dwg_file_io.obj goto ENGINEERROR
+if not exist dwg_geometry.obj goto ENGINEERROR
+if not exist dwg_hatch.obj goto ENGINEERROR
+if not exist dwg_insert.obj goto ENGINEERROR
+if not exist dwg_layer.obj goto ENGINEERROR
+if not exist dwg_leader.obj goto ENGINEERROR
+if not exist dwg_linetype.obj goto ENGINEERROR
+if not exist dwg_mlinestyle.obj goto ENGINEERROR
+if not exist dwg_mtext.obj goto ENGINEERROR
+if not exist dwg_page.obj goto ENGINEERROR
+if not exist dwg_pointstyle.obj goto ENGINEERROR
+if not exist dwg_polyline.obj goto ENGINEERROR
+if not exist dwg_r2000_entity_reader.obj goto ENGINEERROR
 if not exist dwg_r2000_reader.obj goto ENGINEERROR
 if not exist dwg_r2000_writer.obj goto ENGINEERROR
-if not exist dwg_dwg_reader.obj goto ENGINEERROR
-if not exist dwg_document.obj goto ENGINEERROR
+if not exist dwg_r1314_entity_reader.obj goto ENGINEERROR
+if not exist dwg_r2004_decompress.obj goto ENGINEERROR
+if not exist dwg_r2004_entity_reader.obj goto ENGINEERROR
+if not exist dwg_render.obj goto ENGINEERROR
+if not exist dwg_selection.obj goto ENGINEERROR
+if not exist dwg_solid.obj goto ENGINEERROR
+if not exist dwg_style.obj goto ENGINEERROR
+if not exist dwg_text.obj goto ENGINEERROR
+if not exist dwg_transform.obj goto ENGINEERROR
+if not exist dwg_vertex.obj goto ENGINEERROR
 
 REM --- 2) Glue Harbour (usa hbapi.h de Harbour + windows.h de BCC) -------------
 ECHO === Compilando glue Harbour (dwg_hbfunc.c) ===
@@ -157,6 +187,8 @@ if errorlevel 1 goto COMPILEERRORS
 echo -O2 -w- -e%PRG%.exe -I%hdir%\include -I%bcdir%\include -I%fwh%\include %PRG%.c > b32.bc
 %bcdir%\bin\bcc32 -M -c @b32.bc
 
+if not exist %PRG%.obj goto ENGINEERROR
+
 REM --- 5) Link: objetos del motor + glue + dwg_viewer.obj + %PRG%.obj +
 REM     TODAS las libs del build.bat real (sin recortar -- ver la nota en
 REM     PDFEngine32\win32\Build.bat sobre por que la version recortada
@@ -173,6 +205,7 @@ echo dwg_dwg_writer.obj + >> b32.bc
 echo dwg_dxf_reader.obj + >> b32.bc
 echo dwg_dxf_writer.obj + >> b32.bc
 echo dwg_entity.obj + >> b32.bc
+echo dwg_file_io.obj + >> b32.bc
 echo dwg_geometry.obj + >> b32.bc
 echo dwg_hatch.obj + >> b32.bc
 echo dwg_insert.obj + >> b32.bc

@@ -38,16 +38,24 @@
 
 CLASS TDwgBitmap FROM TBitmap
 
-   DATA oViewer                     // TDwgViewer dueño (para ::nScale/::nOriginX/::nOriginY/::pDoc)
+   DATA oViewer                     // TDwgViewer dueño
 
+   // Pan state (middle button or Shift+left)
    DATA lPanning         INIT .F.
    DATA nPanStartRow
    DATA nPanStartCol
    DATA nPanStartOriginX
    DATA nPanStartOriginY
 
+   // Selection state (left button)
+   DATA lSelecting       INIT .F.
+   DATA nSelStartRow
+   DATA nSelStartCol
+
    METHOD LButtonDown( nRow, nCol, nKeyFlags )
    METHOD LButtonUp( nRow, nCol, nKeyFlags )
+   METHOD MButtonDown( nRow, nCol, nKeyFlags )
+   METHOD MButtonUp( nRow, nCol, nKeyFlags )
    METHOD MouseMove( nRow, nCol, nKeyFlags )
    METHOD MouseWheel( nKeys, nDelta, nXPos, nYPos )
 
@@ -58,13 +66,21 @@ ENDCLASS
 METHOD LButtonDown( nRow, nCol, nKeyFlags ) CLASS TDwgBitmap
 
    if ::oViewer != NIL .and. ::oViewer:pDoc != NIL
-      ::lPanning         := .T.
-      ::nPanStartRow     := nRow
-      ::nPanStartCol     := nCol
-      ::nPanStartOriginX := ::oViewer:nOriginX
-      ::nPanStartOriginY := ::oViewer:nOriginY
-      ::Capture()
-      SetCursor( LoadCursor( 0, IDC_HAND ) )
+      // Shift+click = pan, plain click = start selection
+      if nKeyFlags == 2  // MK_SHIFT
+         ::lPanning         := .T.
+         ::nPanStartRow     := nRow
+         ::nPanStartCol     := nCol
+         ::nPanStartOriginX := ::oViewer:nOriginX
+         ::nPanStartOriginY := ::oViewer:nOriginY
+         ::Capture()
+         SetCursor( LoadCursor( 0, IDC_HAND ) )
+      else
+         ::lSelecting       := .T.
+         ::nSelStartRow     := nRow
+         ::nSelStartCol     := nCol
+         ::Capture()
+      endif
    endif
 
 return ::Super:LButtonDown( nRow, nCol, nKeyFlags )
@@ -79,25 +95,66 @@ METHOD LButtonUp( nRow, nCol, nKeyFlags ) CLASS TDwgBitmap
       SetCursor( LoadCursor( 0, IDC_ARROW ) )
    endif
 
+   if ::lSelecting
+      ::lSelecting := .F.
+      ReleaseCapture()
+      ::oViewer:CompleteSelection( ::nSelStartRow, ::nSelStartCol, nRow, nCol, nKeyFlags )
+      SetCursor( LoadCursor( 0, IDC_ARROW ) )
+   endif
+
 return ::Super:LButtonUp( nRow, nCol, nKeyFlags )
+
+//----------------------------------------------------------------------------//
+
+METHOD MButtonDown( nRow, nCol, nKeyFlags ) CLASS TDwgBitmap
+
+   ( nKeyFlags )
+
+   if ::oViewer != NIL .and. ::oViewer:pDoc != NIL
+      ::lPanning         := .T.
+      ::nPanStartRow     := nRow
+      ::nPanStartCol     := nCol
+      ::nPanStartOriginX := ::oViewer:nOriginX
+      ::nPanStartOriginY := ::oViewer:nOriginY
+      ::Capture()
+      SetCursor( LoadCursor( 0, IDC_HAND ) )
+   endif
+
+return 0
+
+//----------------------------------------------------------------------------//
+
+METHOD MButtonUp( nRow, nCol, nKeyFlags ) CLASS TDwgBitmap
+
+   ( nRow )
+   ( nCol )
+   ( nKeyFlags )
+
+   if ::lPanning
+      ::lPanning := .F.
+      ReleaseCapture()
+      SetCursor( LoadCursor( 0, IDC_ARROW ) )
+   endif
+
+return 0
 
 //----------------------------------------------------------------------------//
 
 METHOD MouseMove( nRow, nCol, nKeyFlags ) CLASS TDwgBitmap
 
-   // mismo mecanismo que TPdfBitmap:MouseMove (arrastre con boton
-   // central) en pdf_viewer.prg -- delta en PIXELS desde donde se
-   // apreto el boton, convertido a unidades-mundo via ::nScale. El
-   // signo esta derivado (no copiado) de pixel_x=(world_x-originX)/
-   // scale, pixel_y=(originY-world_y)/scale (ver dwg_render.h): para
-   // que el punto del mundo bajo el cursor se mantenga bajo el cursor
-   // mientras se arrastra, originX debe RESTAR el delta de columna y
-   // originY debe SUMAR el delta de fila.
+   // Pan mode (Shift+left button or middle button)
    if ::lPanning .and. ::oViewer != NIL
       ::oViewer:nOriginX := ::nPanStartOriginX - ( nCol - ::nPanStartCol ) * ::oViewer:nScale
       ::oViewer:nOriginY := ::nPanStartOriginY + ( nRow - ::nPanStartRow ) * ::oViewer:nScale
       ::oViewer:Render()
       SetCursor( LoadCursor( 0, IDC_HAND ) )
+      return 0
+   endif
+
+   // Selection drag mode -- draw rubber-band rectangle over existing content
+   if ::lSelecting .and. ::oViewer != NIL
+      ::oViewer:DrawSelectionRect( ::nSelStartRow, ::nSelStartCol, nRow, nCol )
+      SetCursor( LoadCursor( 0, IDC_ARROW ) )
       return 0
    endif
 
@@ -165,6 +222,9 @@ CLASS TDwgViewer
 
    DATA hBitmap       INIT 0        // HBITMAP actualmente asignado a ::oBmp (para liberarlo antes de reemplazarlo)
 
+   DATA nSelLastRow      INIT -1      // last rubber-band corner (for erasing)
+   DATA nSelLastCol      INIT -1
+
    METHOD New( oWnd, nTop, nLeft, nWidth, nHeight ) CONSTRUCTOR
 
    METHOD Open( cFile )             // abre (o reemplaza) el dibujo mostrado. .T./.F.
@@ -180,7 +240,14 @@ CLASS TDwgViewer
 
    METHOD Render()                  // pide un DWG_RENDERTOHBITMAP fresco al tamanio actual del viewport y lo asigna a ::oBmp
 
-ENDCLASS
+   // Selection
+   METHOD CompleteSelection( nStartRow, nStartCol, nEndRow, nEndCol, nKeyFlags )
+   METHOD DrawSelectionRect( nStartRow, nStartCol, nEndRow, nEndCol )
+   METHOD ClearSelection()
+   METHOD InvertSelection()
+   METHOD RestoreColors( aSelColors )
+
+   ENDCLASS
 
 //----------------------------------------------------------------------------//
 
@@ -367,41 +434,234 @@ METHOD Render() CLASS TDwgViewer
 
    local aRect, nW, nH, aResult
    local hOldBitmap := ::hBitmap
+   local nCount, i, pEnt, aSelColors := {}
 
    if ::pDoc == NIL .or. ::oBmp == NIL
       return .F.
+   endif
+
+   // Highlight selected entities: save colors and set to yellow
+   nCount := Dwg_SelCount( ::pDoc )
+   if nCount > 0
+      for i := 0 to nCount - 1
+         pEnt := Dwg_SelGet( ::pDoc, i )
+         if pEnt != NIL
+            // Store {pEntity, nOriginalColor}
+            AAdd( aSelColors, { pEnt, Dwg_EntityColor( pEnt ) } )
+            Dwg_EntitySetColor( pEnt, 2 )  // ACI 2 = yellow
+         endif
+      next
    endif
 
    aRect := GetClientRect( ::oBmp:hWnd )
    nW    := aRect[ 4 ] - aRect[ 2 ]
    nH    := aRect[ 3 ] - aRect[ 1 ]
    if nW < 1 .or. nH < 1
+      ::RestoreColors( aSelColors )
       return .F.
    endif
 
    aResult := Dwg_RenderToHBitmap( ::pDoc, nW, nH, ::nScale, ::nOriginX, ::nOriginY )
    if aResult == NIL
+      ::RestoreColors( aSelColors )
       return .F.
    endif
+
+   // Restore original colors immediately after render
+   ::RestoreColors( aSelColors )
 
    ::hBitmap      := aResult[ 1 ]
    ::oBmp:hBitmap := ::hBitmap
 
-   // BUG REAL ENCONTRADO (Arturo: captura mostrando la ventana partida
-   // en dos -- mitad con el render nuevo/fondo negro correcto, mitad
-   // con contenido viejo/fondo mas claro sin actualizar) -- ::Refresh()
-   // de TBitmap a veces no invalida el area de cliente COMPLETA
-   // (especialmente al agrandar la ventana, cuando el control crece y
-   // el area recien expuesta nunca recibe un WM_PAINT real). Forzar
-   // InvalidateRect con bErase=.T. + UpdateWindow sincronico garantiza
-   // que TODO el rectangulo se vuelva a pintar con el bitmap nuevo,
-   // sin depender de que TBitmap calcule bien el area sucia.
    ::oBmp:Refresh()
    InvalidateRect( ::oBmp:hWnd, 0, .T. )
    UpdateWindow( ::oBmp:hWnd )
 
    if hOldBitmap != NIL .and. hOldBitmap != 0 .and. hOldBitmap != ::hBitmap
-      DeleteObject( hOldBitmap )   // DWG_RENDERTOHBITMAP entrega un HBITMAP propio en cada llamada (ver dwg_hbfunc.c), igual que PDF_RENDERTOHBITMAP
+      DeleteObject( hOldBitmap )
    endif
 
 return .T.
+
+//----------------------------------------------------------------------------//
+
+METHOD RestoreColors( aSelColors ) CLASS TDwgViewer
+
+   local i
+
+   if aSelColors != NIL
+      for i := 1 to Len( aSelColors )
+         if aSelColors[ i, 1 ] != NIL
+            Dwg_EntitySetColor( aSelColors[ i, 1 ], aSelColors[ i, 2 ] )
+         endif
+      next
+   endif
+
+return nil
+
+//----------------------------------------------------------------------------//
+// Selection methods
+//----------------------------------------------------------------------------//
+
+METHOD CompleteSelection( nStartRow, nStartCol, nEndRow, nEndCol, nKeyFlags ) CLASS TDwgViewer
+
+   local nDeltaRow, nDeltaCol
+   local nPx1, nPy1, nPx2, nPy2
+   local wx1, wy1, wx2, wy2
+   local lShift, nCount, i, pEnt
+
+   if ::pDoc == NIL
+      return nil
+   endif
+
+   nDeltaRow := nEndRow - nStartRow
+   nDeltaCol := nEndCol - nStartCol
+
+   // If barely moved, treat as point pick
+   if Abs( nDeltaRow ) < 4 .and. Abs( nDeltaCol ) < 4
+      // Convert pixel to world
+      nPx1 := nStartCol
+      nPy1 := nStartRow
+      wx1 := ::nOriginX + nPx1 * ::nScale
+      wy1 := ::nOriginY - nPy1 * ::nScale
+
+      lShift := ( nKeyFlags == 2 )  // MK_SHIFT
+
+      if lShift
+         // Toggle selection at point
+         Dwg_SelectPoint( ::pDoc, wx1, wy1, ::nScale * 5.0 )
+         // SelectPoint adds to selection -- for toggle we need to check
+         // if entity was already selected and remove it
+         // Simpler: clear all, then reselect -- but that loses prior selection
+         // Actually, let's use the invert approach below
+         ::InvertSelection()
+      else
+         // Single click: clear previous, select new
+         Dwg_SelClear( ::pDoc )
+         Dwg_SelectPoint( ::pDoc, wx1, wy1, ::nScale * 5.0 )
+      endif
+   else
+      // Rectangle drag: window/crossing select
+      // Convert pixel corners to world coordinates
+      nPx1 := Min( nStartCol, nEndCol )
+      nPy1 := Min( nStartRow, nEndRow )
+      nPx2 := Max( nStartCol, nEndCol )
+      nPy2 := Max( nStartRow, nEndRow )
+
+      wx1 := ::nOriginX + nPx1 * ::nScale
+      wy1 := ::nOriginY - nPy1 * ::nScale
+      wx2 := ::nOriginX + nPx2 * ::nScale
+      wy2 := ::nOriginY - nPy2 * ::nScale
+
+      // Drag left-to-right = window select (must be fully inside)
+      // Drag right-to-left = crossing select (any overlap)
+      if nEndCol < nStartCol
+         // Right-to-left = crossing
+         Dwg_SelectWindow( ::pDoc, wx1, wy1, wx2, wy2, .T. )
+      else
+         // Left-to-right = window
+         Dwg_SelectWindow( ::pDoc, wx1, wy1, wx2, wy2, .F. )
+      endif
+   endif
+
+   ::nSelLastRow := -1
+   ::nSelLastCol := -1
+   ::Render()
+
+return nil
+
+//----------------------------------------------------------------------------//
+
+METHOD DrawSelectionRect( nStartRow, nStartCol, nEndRow, nEndCol ) CLASS TDwgViewer
+
+   local hdc, hPen, hOldPen
+   local nLeft, nTop, nRight, nBottom
+
+   if ::oBmp == NIL
+      return nil
+   endif
+
+   // Erase previous rectangle by redrawing it with XOR
+   if ::nSelLastRow >= 0
+      hdc := GetDC( ::oBmp:hWnd )
+      hPen := CreatePen( PS_DOT, 1, RGB( 255, 0, 0 ) )
+      hOldPen := SelectObject( hdc, hPen )
+      SetROP2( hdc, 2 )  // R2_XORPEN
+      nLeft   := Min( nStartCol, ::nSelLastCol )
+      nTop    := Min( nStartRow, ::nSelLastRow )
+      nRight  := Max( nStartCol, ::nSelLastCol )
+      nBottom := Max( nStartRow, ::nSelLastRow )
+      MoveToEx( hdc, nLeft, nTop, NIL )
+      LineTo( hdc, nRight, nTop )
+      LineTo( hdc, nRight, nBottom )
+      LineTo( hdc, nLeft, nBottom )
+      LineTo( hdc, nLeft, nTop )
+      SelectObject( hdc, hOldPen )
+      DeleteObject( hPen )
+      ReleaseDC( ::oBmp:hWnd, hdc )
+   endif
+
+   // Draw new rectangle with XOR (only border lines)
+   hdc := GetDC( ::oBmp:hWnd )
+   hPen := CreatePen( PS_DOT, 1, RGB( 255, 0, 0 ) )
+   hOldPen := SelectObject( hdc, hPen )
+   SetROP2( hdc, 2 )  // R2_XORPEN
+
+   nLeft   := Min( nStartCol, nEndCol )
+   nTop    := Min( nStartRow, nEndRow )
+   nRight  := Max( nStartCol, nEndCol )
+   nBottom := Max( nStartRow, nEndRow )
+
+   MoveToEx( hdc, nLeft, nTop, NIL )
+   LineTo( hdc, nRight, nTop )
+   LineTo( hdc, nRight, nBottom )
+   LineTo( hdc, nLeft, nBottom )
+   LineTo( hdc, nLeft, nTop )
+
+   SelectObject( hdc, hOldPen )
+   DeleteObject( hPen )
+   ReleaseDC( ::oBmp:hWnd, hdc )
+
+   ::nSelLastRow := nEndRow
+   ::nSelLastCol := nEndCol
+
+return nil
+
+//----------------------------------------------------------------------------//
+
+METHOD ClearSelection() CLASS TDwgViewer
+
+   if ::pDoc != NIL
+      Dwg_SelClear( ::pDoc )
+      ::Render()
+   endif
+
+return nil
+
+//----------------------------------------------------------------------------//
+
+METHOD InvertSelection() CLASS TDwgViewer
+
+   local pEnt, nCount, i
+
+   if ::pDoc == NIL
+      return nil
+   endif
+
+   // Invert: toggle selected flag on each entity currently in selection set
+   // and clear the selection set (it's a temporary working set)
+   nCount := Dwg_SelCount( ::pDoc )
+   for i := 0 to nCount - 1
+      pEnt := Dwg_SelGet( ::pDoc, i )
+      if pEnt != NIL
+         if Dwg_EntitySelected( pEnt )
+            Dwg_EntitySetSelected( pEnt, 0 )
+         else
+            Dwg_EntitySetSelected( pEnt, 1 )
+         endif
+      endif
+   next
+   Dwg_SelClear( ::pDoc )
+   ::Render()
+
+return nil

@@ -22,6 +22,13 @@ HENTITY dwg_add_arc(HDWG hDwg,
                     double start_angle,
                     double end_angle);
 
+HENTITY dwg_add_ellipse(HDWG hDwg,
+                        double cx, double cy, double cz,
+                        double major_axis_x, double major_axis_y, double major_axis_z,
+                        double axis_ratio,
+                        double start_param,
+                        double end_param);
+
 HENTITY dwg_add_polyline(HDWG hDwg);
 HVERTEX dwg_add_vertex(HENTITY hPolyline,
                        double x, double y, double z);

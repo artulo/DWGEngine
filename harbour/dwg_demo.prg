@@ -17,7 +17,7 @@ function Main( cDwg )
    local oWnd, oBar
    local oDwg
 
-   DEFAULT cDwg := "..\tests\entities-2d.dwg"
+   DEFAULT cDwg := "..\tests\02_Planta 1 Baja_A3.dxf"
 
    DEFINE WINDOW oWnd TITLE "DWGEngine - " + cDwg ;
       FROM 0, 0 TO 700, 900 PIXEL

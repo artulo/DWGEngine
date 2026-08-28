@@ -36,8 +36,10 @@ extern "C" {
  * avoid its logical-coordinate-direction ambiguity under a Y-flipped
  * mapping), POINT (small cross), TEXT/MTEXT (TextOutA, rotation via
  * CreateFont's escapement), SOLID (filled quad, DXF's p1-p2-p4-p3
- * winding order), POLYLINE (straight segments between vertices --
- * bulge/arc segments not tessellated yet, drawn as chords). INSERT
+ * winding order), POLYLINE (straight segments and bulge/arc segments
+ * tessellated into line segments), ELLIPSE (parametric tessellation),
+ * 3DFACE (filled quad), LEADER (vertex chain as connected line
+ * segments). INSERT
  * itself still draws nothing directly (its own entity carries no
  * visible geometry) -- but the R2000 reader (dwg_r2000_entity_reader.c)
  * now explodes each INSERT's referenced block content (LINE/CIRCLE/

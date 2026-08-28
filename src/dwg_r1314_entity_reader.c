@@ -13,6 +13,7 @@
 #include "dwg_vertex.h"
 #include "dwg_solid.h"
 #include "dwg_insert.h"
+#include "dwg_leader.h"
 #include "dwg_transform.h"
 
 #ifndef M_PI
@@ -32,8 +33,11 @@
 #define DWG_R1314_TYPE_LINE         0x13
 #define DWG_R1314_TYPE_POINT        0x1B
 #define DWG_R1314_TYPE_SOLID        0x1F
+#define DWG_R1314_TYPE_ELLIPSE       0x1A
+#define DWG_R1314_TYPE_LEADER        0x26
 #define DWG_R1314_TYPE_BLOCK_HEADER 0x31
 #define DWG_R1314_TYPE_LAYER        0x33
+#define DWG_R1314_TYPE_STYLE        0x35
 
 #define DWG_R1314_MAX_LAYER_NAME 256
 #define DWG_R1314_MAX_BLOCK_NAME 256
@@ -64,6 +68,7 @@
    story (a garbage Numreactors value from a stale object-map entry
    drove a `for` loop billions of iterations, no inherent bound). */
 #define DWG_R1314_MAX_REACTORS 1000UL
+#define DWG_R1314_MAX_LEADER_VERTICES 100000UL
 
 typedef struct
 {
@@ -75,6 +80,13 @@ typedef struct
     unsigned long isbylayerlt;
     unsigned long nolinks;
 } DWG_R1314_COMMON_ENTITY;
+
+/* Forward declaration for decode_polyline2d_r1314 which is called from
+   decode_and_transform_block_entity_r1314 but defined later. */
+static HENTITY decode_polyline2d_r1314(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long ms_end_bit,
+                                        const DWG_R1314_COMMON_ENTITY *common,
+                                        const unsigned char *data, unsigned long length,
+                                        const DWG_R2000_OBJMAP *objmap);
 
 static void skip_eed_blocks(DWG_BITSTREAM *bs, unsigned short first_length)
 {
@@ -277,9 +289,14 @@ static int read_common_entity_data_r1314(DWG_BITSTREAM *bs, DWG_R1314_COMMON_ENT
     if (preview_exists != 0UL)
     {
         unsigned long preview_size = dwg_bs_read_rl(bs);
-        if (preview_size > 0x7FFFFFFFUL)
+        unsigned long cur_bit, preview_bits;
+        if (preview_size > 100000000UL)
             return 0;
-        dwg_bs_seek_bit(bs, dwg_bs_tell_bit(bs) + preview_size * 8UL);
+        preview_bits = preview_size * 8UL;
+        cur_bit = dwg_bs_tell_bit(bs);
+        if (cur_bit + preview_bits < cur_bit)
+            return 0;
+        dwg_bs_seek_bit(bs, cur_bit + preview_bits);
     }
 
     out->obj_size_bits = dwg_bs_read_rl(bs);
@@ -460,6 +477,79 @@ static HENTITY decode_arc_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
 
     return dwg_add_arc(hDwg, center.x, center.y, center.z, radius,
                        start_angle_rad * 180.0 / M_PI, end_angle_rad * 180.0 / M_PI);
+}
+
+static HENTITY decode_ellipse_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
+{
+    DWG_POINT3D center, major_axis;
+    double axis_ratio, start_param, end_param;
+
+    dwg_bs_read_3bd(bs, &center);
+    dwg_bs_read_3bd(bs, &major_axis);
+    axis_ratio = dwg_bs_read_bd(bs);
+    start_param = dwg_bs_read_bd(bs);
+    end_param = dwg_bs_read_bd(bs);
+
+    if (!is_plausible_coord(center.x) || !is_plausible_coord(center.y) || !is_plausible_coord(center.z) ||
+        !is_plausible_coord(major_axis.x) || !is_plausible_coord(major_axis.y) || !is_plausible_coord(major_axis.z))
+        return NULL;
+
+    return dwg_add_ellipse(hDwg, center.x, center.y, center.z,
+                           major_axis.x, major_axis.y, major_axis.z,
+                           axis_ratio, start_param, end_param);
+}
+
+static HENTITY decode_leader_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
+{
+    unsigned char class_version;
+    double arrow_size;
+    unsigned short path_type, creation_type;
+    unsigned char annot_handle_code;
+    unsigned long annot_handle_value;
+    unsigned long num_vertex, i;
+    HENTITY e;
+
+    class_version = dwg_bs_read_rc(bs);
+    arrow_size = dwg_bs_read_bd(bs);
+    path_type = dwg_bs_read_bs(bs);
+    creation_type = dwg_bs_read_bs(bs);
+    (void)path_type; (void)creation_type;
+
+    dwg_bs_read_handle(bs, &annot_handle_code, &annot_handle_value);
+
+    num_vertex = dwg_bs_read_bl(bs);
+    if (num_vertex > DWG_R1314_MAX_LEADER_VERTICES)
+        num_vertex = DWG_R1314_MAX_LEADER_VERTICES;
+
+    e = dwg_add_leader(hDwg);
+    if (e == NULL)
+        return NULL;
+
+    dwg_leader_set_arrow_size(e, arrow_size);
+
+    for (i = 0UL; i < num_vertex; i++)
+    {
+        DWG_POINT3D pt;
+        dwg_bs_read_3bd(bs, &pt);
+        if (!is_plausible_coord(pt.x) || !is_plausible_coord(pt.y) || !is_plausible_coord(pt.z))
+        {
+            dwg_entity_destroy(e);
+            return NULL;
+        }
+        dwg_leader_add_vertex(e, pt.x, pt.y, pt.z);
+    }
+
+    {
+        DWG_POINT3D extrusion;
+        dwg_bs_read_3bd(bs, &extrusion);
+    }
+    {
+        DWG_POINT3D xto_dir;
+        dwg_bs_read_3bd(bs, &xto_dir);
+    }
+    (void)dwg_bs_read_bs(bs);
+
+    return e;
 }
 
 static HENTITY decode_point_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
@@ -690,6 +780,7 @@ static int decode_and_transform_block_entity_r1314(HDWG hDwg, const unsigned cha
                                                     double ins_x, double ins_y, double ins_z,
                                                     double scale_x, double scale_y, double scale_z,
                                                     double rotation_deg,
+                                                    const DWG_R2000_OBJMAP *objmap,
                                                     unsigned long *next_handle)
 {
     DWG_BITSTREAM bs;
@@ -705,21 +796,29 @@ static int decode_and_transform_block_entity_r1314(HDWG hDwg, const unsigned cha
     ms_end_bit = dwg_bs_tell_bit(&bs);
     obj_type = dwg_bs_read_bs(&bs);
 
-    if (obj_type != DWG_R1314_TYPE_LINE && obj_type != DWG_R1314_TYPE_CIRCLE &&
-        obj_type != DWG_R1314_TYPE_ARC && obj_type != DWG_R1314_TYPE_POINT &&
-        obj_type != DWG_R1314_TYPE_SOLID)
-        return 0;
-
     if (!read_common_entity_data_r1314(&bs, &common))
         return 0;
+
+    if (obj_type != DWG_R1314_TYPE_LINE && obj_type != DWG_R1314_TYPE_CIRCLE &&
+        obj_type != DWG_R1314_TYPE_ARC && obj_type != DWG_R1314_TYPE_POINT &&
+        obj_type != DWG_R1314_TYPE_SOLID && obj_type != DWG_R1314_TYPE_ELLIPSE &&
+        obj_type != DWG_R1314_TYPE_TEXT && obj_type != DWG_R1314_TYPE_POLYLINE2D &&
+        obj_type != DWG_R1314_TYPE_INSERT)
+    {
+        *next_handle = find_entity_next_handle_r1314(&bs, ms_end_bit, &common, cur_handle);
+        return 1;
+    }
 
     switch (obj_type)
     {
     case DWG_R1314_TYPE_LINE:   e = decode_line_r1314(hDwg, &bs);   break;
     case DWG_R1314_TYPE_CIRCLE: e = decode_circle_r1314(hDwg, &bs); break;
     case DWG_R1314_TYPE_ARC:    e = decode_arc_r1314(hDwg, &bs);    break;
+    case DWG_R1314_TYPE_ELLIPSE: e = decode_ellipse_r1314(hDwg, &bs); break;
     case DWG_R1314_TYPE_POINT:  e = decode_point_r1314(hDwg, &bs);  break;
     case DWG_R1314_TYPE_SOLID:  e = decode_solid_r1314(hDwg, &bs);  break;
+    case DWG_R1314_TYPE_TEXT:    e = decode_text_r1314(hDwg, &bs);   break;
+    case DWG_R1314_TYPE_POLYLINE2D: e = decode_polyline2d_r1314(hDwg, &bs, ms_end_bit, &common, data, length, objmap); break;
     default: break;
     }
 
@@ -738,44 +837,7 @@ static int decode_and_transform_block_entity_r1314(HDWG hDwg, const unsigned cha
     return 1;
 }
 
-static unsigned char *read_whole_file(const char *path, unsigned long *out_length)
-{
-    FILE *fp;
-    long size;
-    unsigned char *buf;
-
-    fp = fopen(path, "rb");
-    if (fp == NULL)
-        return NULL;
-
-    fseek(fp, 0, SEEK_END);
-    size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (size < 0)
-    {
-        fclose(fp);
-        return NULL;
-    }
-
-    buf = (unsigned char *)malloc((size_t)size);
-    if (buf == NULL)
-    {
-        fclose(fp);
-        return NULL;
-    }
-
-    if (fread(buf, 1, (size_t)size, fp) != (size_t)size)
-    {
-        free(buf);
-        fclose(fp);
-        return NULL;
-    }
-
-    fclose(fp);
-    *out_length = (unsigned long)size;
-    return buf;
-}
+/* read_whole_file removed -- use dwg_read_whole_file from dwg_file_io.c */
 
 /* Binary search, not linear -- see the identical comment in
    dwg_r2000_entity_reader.c's own objmap_find, same root cause and
@@ -918,8 +980,8 @@ static HENTITY decode_insert_r1314(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long m
                 break;
 
             if (!decode_and_transform_block_entity_r1314(hDwg, data, length, eloc, cur, &block_base_pt,
-                                                         ins.x, ins.y, ins.z, sx, sy, sz,
-                                                         rotation_rad * 180.0 / M_PI, &next))
+                                                          ins.x, ins.y, ins.z, sx, sy, sz,
+                                                          rotation_rad * 180.0 / M_PI, objmap, &next))
                 break;
 
             if (reached_last)
@@ -1133,7 +1195,7 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
         return NULL;
     }
 
-    data = read_whole_file(path, &length);
+    data = dwg_read_whole_file(path, &length);
     if (data == NULL)
     {
         if (result != NULL) *result = DWG_IO_ERROR_OPEN;
@@ -1232,8 +1294,9 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
         if (obj_type != DWG_R1314_TYPE_LINE && obj_type != DWG_R1314_TYPE_CIRCLE &&
             obj_type != DWG_R1314_TYPE_ARC && obj_type != DWG_R1314_TYPE_POINT &&
             obj_type != DWG_R1314_TYPE_TEXT && obj_type != DWG_R1314_TYPE_POLYLINE2D &&
-            obj_type != DWG_R1314_TYPE_SOLID && obj_type != DWG_R1314_TYPE_INSERT)
-            continue; /* not modeled (or, for a stale map entry, not a real object at all) */
+            obj_type != DWG_R1314_TYPE_SOLID && obj_type != DWG_R1314_TYPE_INSERT &&
+            obj_type != DWG_R1314_TYPE_ELLIPSE)
+            continue;
 
         if (!read_common_entity_data_r1314(&bs, &common))
             continue;
@@ -1243,6 +1306,7 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
         case DWG_R1314_TYPE_LINE:   e = decode_line_r1314(hDwg, &bs);   break;
         case DWG_R1314_TYPE_CIRCLE: e = decode_circle_r1314(hDwg, &bs); break;
         case DWG_R1314_TYPE_ARC:    e = decode_arc_r1314(hDwg, &bs);    break;
+        case DWG_R1314_TYPE_ELLIPSE: e = decode_ellipse_r1314(hDwg, &bs); break;
         case DWG_R1314_TYPE_POINT:  e = decode_point_r1314(hDwg, &bs);  break;
         case DWG_R1314_TYPE_SOLID:  e = decode_solid_r1314(hDwg, &bs);  break;
         case DWG_R1314_TYPE_TEXT:   e = decode_text_r1314(hDwg, &bs);   break;
@@ -1277,6 +1341,24 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
                    BYLAYER, resolve the real color from the layer instead. */
                 if (common.color == 0U || common.color == 256U)
                     apply_color(e, layer_color);
+            }
+
+            /* Resolve STYLE handle for TEXT entities -- the STYLE handle
+               sits right after the LAYER handle in R13-R14 handle order. */
+            if (obj_type == DWG_R1314_TYPE_TEXT)
+            {
+                unsigned char hcode;
+                unsigned long hval, style_handle, style_loc;
+                char style_name[256];
+
+                dwg_bs_read_handle(&bs, &hcode, &style_handle);
+                if (objmap_find(&objmap, style_handle, &style_loc) &&
+                    style_loc + 6UL < length &&
+                    decode_table_record_name_r1314(data, length, style_loc, DWG_R1314_TYPE_STYLE, style_name, sizeof(style_name), NULL))
+                {
+                    dwg_text_set_style_name(e, style_name);
+                }
+                (void)hval;
             }
         }
     }

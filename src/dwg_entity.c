@@ -223,3 +223,20 @@ const void *dwg_entity_get_ex_data(HENTITY hEntity,
 
     return hEntity->ex_data;
 }
+
+void dwg_entity_set_selected(HENTITY hEntity, int selected)
+{
+    if (hEntity == NULL)
+        return;
+    if (selected)
+        hEntity->flags |= DWG_ENTITY_FLAG_SELECTED;
+    else
+        hEntity->flags &= ~DWG_ENTITY_FLAG_SELECTED;
+}
+
+int dwg_entity_is_selected(HENTITY hEntity)
+{
+    if (hEntity == NULL)
+        return 0;
+    return (hEntity->flags & DWG_ENTITY_FLAG_SELECTED) != 0;
+}

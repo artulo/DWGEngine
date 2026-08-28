@@ -72,6 +72,15 @@ typedef struct _DWG_ARC3D
     double end_angle;
 } DWG_ARC3D;
 
+typedef struct _DWG_ELLIPSE3D
+{
+    DWG_POINT3D center;
+    DWG_POINT3D major_axis_endpoint;
+    double axis_ratio;
+    double start_param;
+    double end_param;
+} DWG_ELLIPSE3D;
+
 #ifdef __cplusplus
 }
 #endif
