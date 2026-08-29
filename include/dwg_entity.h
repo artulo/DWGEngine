@@ -52,12 +52,6 @@ long dwg_entity_put_ex_data(HENTITY hEntity, const void *data,
 const void *dwg_entity_get_ex_data(HENTITY hEntity,
                                    unsigned long *size);
 
-/* Selection flag for visual highlighting in the viewer */
-#define DWG_ENTITY_FLAG_SELECTED  0x0001
-
-void dwg_entity_set_selected(HENTITY hEntity, int selected);
-int dwg_entity_is_selected(HENTITY hEntity);
-
 #ifdef __cplusplus
 }
 #endif

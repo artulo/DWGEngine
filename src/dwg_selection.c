@@ -123,9 +123,49 @@ static int entity_hit_test(HENTITY e, double px, double py, double tolerance)
     }
     case DWG_ENTITY_TEXT:
     {
-        double x, y, z;
+        /* Bounding-box aproximado, no un solo punto en la insercion --
+           bug real reportado por Arturo 2026-08-27 ("no funciona ni en
+           los textos originales"): un click tenia que caer casi exacto
+           sobre el anchor (esquina inferior-izquierda del texto), no en
+           cualquier lugar sobre las letras dibujadas, asi que ni el
+           click simple seleccionaba nada salvo apuntando justo ahi.
+           Sin metricas GDI reales aca (esta funcion corre sin HDC,
+           independiente del render) el ancho se estima con un factor
+           caracter/altura tipico (0.6) por la cantidad de caracteres --
+           aproximado a proposito, cubre el area visible real mucho
+           mejor que un punto. El punto de click se rota al sistema
+           LOCAL del texto (insercion en el origen, eje X = direccion
+           del texto) en vez de rotar el rectangulo -- mismo resultado,
+           menos cuentas. */
+        double x, y, z, height, angle, wfactor, text_w, text_h;
+        const char *text;
+        double rad, c, s, dx, dy, lx, ly;
+
         dwg_text_get_point(e, &x, &y, &z);
-        return dist_points(px, py, x, y) <= tolerance;
+        height  = dwg_text_get_height(e);
+        angle   = dwg_text_get_angle(e);
+        wfactor = dwg_text_get_width_factor(e);
+        text    = dwg_text_get_text(e);
+
+        if (height <= 0.0)
+            height = 2.5;
+        if (wfactor <= 0.0)
+            wfactor = 1.0;
+        text_h = height;
+        text_w = (text != NULL ? (double)strlen(text) : 0.0) * height * 0.6 * wfactor;
+        if (text_w <= 0.0)
+            text_w = height;
+
+        rad = -angle * M_PI / 180.0;
+        c = cos(rad);
+        s = sin(rad);
+        dx = px - x;
+        dy = py - y;
+        lx = dx * c - dy * s;
+        ly = dx * s + dy * c;
+
+        return lx >= -tolerance && lx <= text_w + tolerance &&
+               ly >= -tolerance && ly <= text_h + tolerance;
     }
     case DWG_ENTITY_MTEXT:
     {
@@ -274,9 +314,45 @@ static void entity_bbox(HENTITY e, double *xmin, double *ymin, double *xmax, dou
     }
     case DWG_ENTITY_TEXT:
     {
-        double x, y, z;
+        /* Mismo criterio/motivo que el bounding-box aproximado de
+           entity_hit_test de arriba -- sin esto, una ventana de
+           seleccion que rodea visualmente todo el texto pero no toca
+           el anchor (esquina inferior-izquierda) tampoco lo
+           seleccionaba. Los 4 vertices del rectangulo LOCAL (insercion
+           en el origen) se rotan a mundo y se acumulan todos -- da el
+           AABB correcto incluso con texto rotado. */
+        double x, y, z, height, angle, wfactor, text_w, text_h;
+        const char *text;
+        double rad, c, s;
+        double lx[4], ly[4];
+        int i;
+
         dwg_text_get_point(e, &x, &y, &z);
-        bbox_include(x, y, xmin, ymin, xmax, ymax, valid);
+        height  = dwg_text_get_height(e);
+        angle   = dwg_text_get_angle(e);
+        wfactor = dwg_text_get_width_factor(e);
+        text    = dwg_text_get_text(e);
+
+        if (height <= 0.0)
+            height = 2.5;
+        if (wfactor <= 0.0)
+            wfactor = 1.0;
+        text_h = height;
+        text_w = (text != NULL ? (double)strlen(text) : 0.0) * height * 0.6 * wfactor;
+        if (text_w <= 0.0)
+            text_w = height;
+
+        lx[0] = 0.0;    ly[0] = 0.0;
+        lx[1] = text_w; ly[1] = 0.0;
+        lx[2] = text_w; ly[2] = text_h;
+        lx[3] = 0.0;    ly[3] = text_h;
+
+        rad = angle * M_PI / 180.0;
+        c = cos(rad);
+        s = sin(rad);
+        for (i = 0; i < 4; i++)
+            bbox_include(x + lx[i] * c - ly[i] * s, y + lx[i] * s + ly[i] * c,
+                        xmin, ymin, xmax, ymax, valid);
         break;
     }
     case DWG_ENTITY_MTEXT:

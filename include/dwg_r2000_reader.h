@@ -100,6 +100,22 @@ long dwg_r2000_parse_object_map(const unsigned char *data, unsigned long length,
                                 unsigned long seeker, unsigned long size,
                                 DWG_R2000_OBJMAP *out);
 
+/*
+ * Same object-map parsing as dwg_r2000_parse_object_map (identical
+ * section/CRC framing, shared by R13/R14/R2000 -- see dwg_r2000_
+ * parse_header's own comment), but for the handle-drift resync and
+ * per-object structural validation steps, uses R13/R14's real field
+ * order (Type -> Handle directly) instead of R2000's (Type -> obj_
+ * size -> Handle). Use this from the R13/R14 reader instead of
+ * dwg_r2000_parse_object_map -- using the wrong one silently
+ * misreads every object's own handle field for validation purposes
+ * (a real, confirmed bug this project already hit once with the
+ * carving repair before this function existed).
+ */
+long dwg_r1314_parse_object_map(const unsigned char *data, unsigned long length,
+                                unsigned long seeker, unsigned long size,
+                                DWG_R2000_OBJMAP *out);
+
 void dwg_r2000_objmap_free(DWG_R2000_OBJMAP *map);
 
 /*

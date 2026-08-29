@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "dwg_render.h"
 #include "dwg_document.h"
@@ -13,7 +14,8 @@
 #include "dwg_solid.h"
 #include "dwg_insert.h"
 #include "dwg_hatch.h"
-#include "dwg_leader.h"
+#include "dwg_layer.h"
+#include "dwg_dimension.h"
 #include "dwg_style.h"
 
 #ifndef M_PI
@@ -28,15 +30,20 @@
 typedef struct
 {
     HDC hdc;
-    HDWG hDwg;
     double scale;
     double origin_x, origin_y;
+    const DWG_CAMERA3D *camera; /* NULL = vista plana 2D de siempre */
     HPEN pen;
     unsigned short pen_color;
     int pen_valid;
     HBRUSH brush;
     unsigned short brush_color;
     int brush_valid;
+    HDWG hDwg; /* pedido de Arturo 2026-08-26 ("agregar funcion para escribir texto
+                  definiendo el tipo de letra y tamaño") -- resolve_text_font
+                  necesita el documento para buscar el STYLE real de cada TEXT,
+                  nunca antes hacia falta que DWG_RENDER_CTX supiera de que
+                  documento viene */
 } DWG_RENDER_CTX;
 
 /*
@@ -98,8 +105,22 @@ static COLORREF ensure_min_brightness(COLORREF c)
     return c;
 }
 
+/*
+ * Pseudo-"color" fuera de todo rango ACI real (0-255, mas 0=BYBLOCK y
+ * 256=BYLAYER ya reservados) -- usado SOLO internamente por el loop de
+ * dwg_render_to_hdc para pedirle a set_pen_for_color/set_brush_for_color
+ * el color de resaltado de seleccion en vez del color real de la
+ * entidad, reusando el mismo mecanismo de cache de pen/brush por color
+ * sin duplicar logica (ver dwg_document_sel_contains en el loop). No es
+ * un ACI valido y jamas debe guardarse en una entidad.
+ */
+#define DWG_RENDER_SELECTED_PSEUDO_COLOR 0xFFFFU
+
 static COLORREF aci_to_colorref_raw(unsigned short aci)
 {
+    if (aci == DWG_RENDER_SELECTED_PSEUDO_COLOR)
+        return RGB(255, 0, 255); /* magenta fijo -- resaltado de seleccion, no pasa por la paleta ACI */
+
     switch (aci)
     {
     case 1: return RGB(255, 0, 0);     /* red */
@@ -192,28 +213,160 @@ static void set_brush_for_color(DWG_RENDER_CTX *rc, unsigned short color)
     rc->brush_valid = 1;
 }
 
-static void world_to_pixel(const DWG_RENDER_CTX *rc, double wx, double wy, LONG *px, LONG *py)
+/*
+ * Camara orbital de proyeccion paralela (ver DWG_CAMERA3D en
+ * dwg_render.h): rota (wx-target,wy-target,wz-target) por -azimuth
+ * alrededor de Z mundo, despues por -elevation alrededor del eje X
+ * resultante -> vista (vx,vy,vz) donde vx=pantalla-X, vz=pantalla-Y
+ * (arriba), vy=profundidad (sin usar en v1 -- wireframe, sin
+ * ordenamiento de profundidad para caras rellenas todavia).
+ */
+static void project_camera(const DWG_CAMERA3D *cam, double wx, double wy, double wz,
+                           double *out_x, double *out_y)
 {
-    *px = (LONG)floor((wx - rc->origin_x) / rc->scale + 0.5);
-    *py = (LONG)floor((rc->origin_y - wy) / rc->scale + 0.5);
+    double dx = wx - cam->target_x;
+    double dy = wy - cam->target_y;
+    double dz = wz - cam->target_z;
+    double ca = cos(-cam->azimuth), sa = sin(-cam->azimuth);
+    double ce = cos(-cam->elevation), se = sin(-cam->elevation);
+    /* rotacion alrededor de Z (azimuth) */
+    double rx = dx * ca - dy * sa;
+    double ry = dx * sa + dy * ca;
+    double rz = dz;
+    /* rotacion alrededor del eje X resultante (elevation) */
+    double vy = ry * ce - rz * se;
+    double vz = ry * se + rz * ce;
+
+    *out_x = rx;
+    *out_y = vz;
+    (void)vy; /* profundidad de camara -- descartada, ver dwg_render_to_hdc para el porque (relleno con
+                 ordenamiento pintor probado y revertido 2026-08-26, ver memoria/git) */
 }
 
-static void draw_segment(const DWG_RENDER_CTX *rc, double x1, double y1, double x2, double y2)
+static void world_to_pixel(const DWG_RENDER_CTX *rc, double wx, double wy, double wz, LONG *px, LONG *py)
+{
+    double vx = wx, vy = wy;
+
+    if (rc->camera != NULL)
+        project_camera(rc->camera, wx, wy, wz, &vx, &vy);
+
+    *px = (LONG)floor((vx - rc->origin_x) / rc->scale + 0.5);
+    *py = (LONG)floor((rc->origin_y - vy) / rc->scale + 0.5);
+}
+
+static void draw_segment(const DWG_RENDER_CTX *rc, double x1, double y1, double z1,
+                         double x2, double y2, double z2)
 {
     LONG px1, py1, px2, py2;
-    world_to_pixel(rc, x1, y1, &px1, &py1);
-    world_to_pixel(rc, x2, y2, &px2, &py2);
+    world_to_pixel(rc, x1, y1, z1, &px1, &py1);
+    world_to_pixel(rc, x2, y2, z2, &px2, &py2);
     MoveToEx(rc->hdc, px1, py1, NULL);
     LineTo(rc->hdc, px2, py2);
+}
+
+/* Real, confirmed gap found via this exact function's absence: a
+   POLYLINE vertex's bulge (curved-segment) field was being decoded
+   and stored (dwg_vertex_get_bulge) but draw_polyline (below) never
+   read it, drawing every segment as a straight chord regardless --
+   Arturo caught this on real door-swing/fixture symbols modeled as
+   bulged 2D polylines ("lineas... en las elipces no son las lineas
+   continuas"). draw_hatch already had this exact tessellation for
+   HATCH boundaries (a similar gap Arturo found earlier); this is the
+   same bulge-to-arc math (bulge = tan(included_angle/4), see
+   dwg_transform.c's own private bulge_to_arc for the full derivation)
+   adapted to draw actual line segments immediately instead of
+   collecting points for a later Polygon() fill. Falls back to a
+   straight segment for bulge==0.0 (the overwhelmingly common case)
+   or a degenerate chord, same as append_bulge_arc's own guard. */
+#define DWG_POLYLINE_ARC_SEGMENTS 16UL
+
+static void draw_bulge_segment(const DWG_RENDER_CTX *rc, double x1, double y1, double z1,
+                               double x2, double y2, double z2, double bulge)
+{
+    double dx = x2 - x1;
+    double dy = y2 - y1;
+    double chord = sqrt(dx * dx + dy * dy);
+    double included, sagitta, perp_x, perp_y, mid_x, mid_y;
+    double cx, cy, radius, start_angle, end_angle, sweep;
+    double prev_x, prev_y;
+    unsigned long s;
+
+    if (bulge == 0.0 || chord < 1.0e-9)
+    {
+        draw_segment(rc, x1, y1, z1, x2, y2, z2);
+        return;
+    }
+
+    included = 4.0 * atan(bulge);
+    sagitta = (chord / 2.0) * bulge;
+    perp_x = -dy / chord;
+    perp_y = dx / chord;
+    mid_x = (x1 + x2) / 2.0;
+    mid_y = (y1 + y2) / 2.0;
+
+    radius = chord / (2.0 * fabs(sin(included / 2.0)));
+    cx = mid_x + perp_x * (radius - sagitta);
+    cy = mid_y + perp_y * (radius - sagitta);
+    start_angle = atan2(y1 - cy, x1 - cx);
+    end_angle = atan2(y2 - cy, x2 - cx);
+
+    sweep = end_angle - start_angle;
+    /* fmod-based, O(1) normalization -- same fix, same reasoning, as
+       draw_arc's own sweep normalization (see its comment) instead of
+       an unbounded while loop. */
+    sweep = fmod(sweep, 2.0 * M_PI);
+    if (bulge > 0.0) { if (sweep <= 0.0) sweep += 2.0 * M_PI; }
+    else             { if (sweep >= 0.0) sweep -= 2.0 * M_PI; }
+
+    prev_x = x1; prev_y = y1;
+    {
+        double prev_z = z1;
+        for (s = 1UL; s <= DWG_POLYLINE_ARC_SEGMENTS; s++)
+        {
+            double frac = (double)s / (double)DWG_POLYLINE_ARC_SEGMENTS;
+            double a = start_angle + sweep * frac;
+            double x = cx + radius * cos(a);
+            double y = cy + radius * sin(a);
+            double z = z1 + (z2 - z1) * frac; /* interpolacion lineal de Z a lo largo del arco */
+            draw_segment(rc, prev_x, prev_y, prev_z, x, y, z);
+            prev_x = x; prev_y = y; prev_z = z;
+        }
+    }
 }
 
 /* Arc/circle segment count: enough to look smooth without wasting time
    on tiny arcs -- 72 segments for a full circle (5 degrees each),
    scaled down proportionally for a shorter sweep, floor of 8. */
+/* Real, confirmed hang found via this exact gap: this cast trusted
+   sweep_rad to already be a small, sane value, with no bound of its
+   own -- fine as long as every caller validates its angle inputs
+   first (both real decode_arc's now do, after Arturo hit a real
+   hang: "se cuelga"), but casting an out-of-range double to unsigned
+   long is undefined behavior in C, and on this compiler/runtime it
+   produced a garbage-huge count rather than clamping or trapping, so
+   a single bad ARC could send draw_arc's loop into billions of
+   iterations. Bounding here too (not just at the decode-time source)
+   means this function can never be handed a future unvalidated angle
+   -- from a new entity type, a different file format's reader, or a
+   fix that regresses -- and still stay safe. */
+#define DWG_RENDER_MAX_ARC_SEGMENTS 4096UL
+
 static unsigned long segment_count_for_sweep(double sweep_rad)
 {
-    double frac = sweep_rad / (2.0 * M_PI);
-    unsigned long n = (unsigned long)(frac * 72.0 + 0.5);
+    double frac, count_d;
+    unsigned long n;
+
+    if (!(sweep_rad > -1.0e6 && sweep_rad < 1.0e6)) /* NaN-safe: false for NaN too */
+        return 8UL;
+
+    frac = sweep_rad / (2.0 * M_PI);
+    count_d = frac * 72.0 + 0.5;
+    if (count_d < 8.0)
+        return 8UL;
+    if (count_d > (double)DWG_RENDER_MAX_ARC_SEGMENTS)
+        return DWG_RENDER_MAX_ARC_SEGMENTS;
+
+    n = (unsigned long)count_d;
     return n < 8UL ? 8UL : n;
 }
 
@@ -221,7 +374,7 @@ static void draw_line(const DWG_RENDER_CTX *rc, HENTITY e)
 {
     DWG_LINE3D *g = (DWG_LINE3D *)e->geometry;
     if (g == NULL) return;
-    draw_segment(rc, g->start.x, g->start.y, g->end.x, g->end.y);
+    draw_segment(rc, g->start.x, g->start.y, g->start.z, g->end.x, g->end.y, g->end.z);
 }
 
 static void draw_circle(const DWG_RENDER_CTX *rc, HENTITY e)
@@ -237,7 +390,7 @@ static void draw_circle(const DWG_RENDER_CTX *rc, HENTITY e)
         double x = g->center.x + g->radius * cos(a);
         double y = g->center.y + g->radius * sin(a);
         if (i > 0UL)
-            draw_segment(rc, prev_x, prev_y, x, y);
+            draw_segment(rc, prev_x, prev_y, g->center.z, x, y, g->center.z);
         prev_x = x; prev_y = y;
     }
 }
@@ -253,7 +406,16 @@ static void draw_arc(const DWG_RENDER_CTX *rc, HENTITY e)
     start_rad = g->start_angle * M_PI / 180.0;
     end_rad = g->end_angle * M_PI / 180.0;
     sweep = end_rad - start_rad;
-    while (sweep <= 0.0) sweep += 2.0 * M_PI; /* DWG arcs always sweep counterclockwise, start->end */
+    /* Real, confirmed hang found via this exact loop: for a wildly
+       out-of-range sweep (an unvalidated garbage angle -- see
+       decode_arc's own comment for how one could get this far) this
+       could take an astronomical number of iterations to walk back
+       into range one 2*M_PI step at a time. fmod is O(1) regardless
+       of magnitude and NaN-safe (fmod of NaN is NaN, which then fails
+       the <= 0.0 check and falls through unchanged, same as any other
+       already-in-range value -- no worse than before for that case). */
+    sweep = fmod(sweep, 2.0 * M_PI);
+    if (sweep <= 0.0) sweep += 2.0 * M_PI; /* DWG arcs always sweep counterclockwise, start->end */
 
     n = segment_count_for_sweep(sweep);
     for (i = 0UL; i <= n; i++)
@@ -262,7 +424,7 @@ static void draw_arc(const DWG_RENDER_CTX *rc, HENTITY e)
         double x = g->center.x + g->radius * cos(a);
         double y = g->center.y + g->radius * sin(a);
         if (i > 0UL)
-            draw_segment(rc, prev_x, prev_y, x, y);
+            draw_segment(rc, prev_x, prev_y, g->center.z, x, y, g->center.z);
         prev_x = x; prev_y = y;
     }
 }
@@ -272,7 +434,7 @@ static void draw_point(const DWG_RENDER_CTX *rc, HENTITY e)
     DWG_POINT3D *g = (DWG_POINT3D *)e->geometry;
     LONG px, py;
     if (g == NULL) return;
-    world_to_pixel(rc, g->x, g->y, &px, &py);
+    world_to_pixel(rc, g->x, g->y, g->z, &px, &py);
     MoveToEx(rc->hdc, px - 3, py, NULL);
     LineTo(rc->hdc, px + 4, py);
     MoveToEx(rc->hdc, px, py - 3, NULL);
@@ -282,10 +444,10 @@ static void draw_point(const DWG_RENDER_CTX *rc, HENTITY e)
 static void draw_polyline(const DWG_RENDER_CTX *rc, HENTITY e)
 {
     HPOLYLINE pl = dwg_polyline_from_entity(e);
-    HVERTEX v;
-    double prev_x = 0.0, prev_y = 0.0, prev_bulge = 0.0;
+    HVERTEX v, first;
+    double prev_x = 0.0, prev_y = 0.0, prev_z = 0.0, prev_bulge = 0.0;
     int have_prev = 0;
-    double fx = 0.0, fy = 0.0;
+    double fx = 0.0, fy = 0.0, fz = 0.0;
     if (pl == NULL) return;
 
     for (v = dwg_polyline_first_vertex(pl); v != NULL; v = dwg_polyline_next_vertex(v))
@@ -293,109 +455,20 @@ static void draw_polyline(const DWG_RENDER_CTX *rc, HENTITY e)
         double x, y, z, bulge;
         dwg_vertex_get_point(v, &x, &y, &z);
         bulge = dwg_vertex_get_bulge(v);
-
         if (have_prev)
-        {
-            if (prev_bulge != 0.0)
-            {
-                /* Tessellate the arc segment between prev and current vertex.
-                   bulge = tan(included_angle/4), same convention as HATCH. */
-                double dx = x - prev_x;
-                double dy = y - prev_y;
-                double chord = sqrt(dx * dx + dy * dy);
-                if (chord > 1.0e-9)
-                {
-                    double included = 4.0 * atan(prev_bulge);
-                    double sagitta = (chord / 2.0) * prev_bulge;
-                    double perp_x = -dy / chord;
-                    double perp_y = dx / chord;
-                    double mid_x = (prev_x + x) / 2.0;
-                    double mid_y = (prev_y + y) / 2.0;
-                    double radius = chord / (2.0 * fabs(sin(included / 2.0)));
-                    double cx = mid_x + perp_x * (radius - sagitta);
-                    double cy = mid_y + perp_y * (radius - sagitta);
-                    double start_angle = atan2(prev_y - cy, prev_x - cx);
-                    double end_angle = atan2(y - cy, x - cx);
-                    double sweep = end_angle - start_angle;
-                    unsigned long n, s;
-
-                    if (prev_bulge > 0.0) { while (sweep <= 0.0) sweep += 2.0 * M_PI; }
-                    else                  { while (sweep >= 0.0) sweep -= 2.0 * M_PI; }
-
-                    n = segment_count_for_sweep(sweep);
-                    for (s = 1UL; s <= n; s++)
-                    {
-                        double a = start_angle + sweep * ((double)s / (double)n);
-                        double ax = cx + radius * cos(a);
-                        double ay = cy + radius * sin(a);
-                        draw_segment(rc, prev_x, prev_y, ax, ay);
-                        prev_x = ax; prev_y = ay;
-                    }
-                }
-                else
-                {
-                    draw_segment(rc, prev_x, prev_y, x, y);
-                }
-            }
-            else
-            {
-                draw_segment(rc, prev_x, prev_y, x, y);
-            }
-        }
+            draw_bulge_segment(rc, prev_x, prev_y, prev_z, x, y, z, prev_bulge);
         else
         {
-            fx = x; fy = y;
+            fx = x; fy = y; fz = z;
         }
-        prev_x = x; prev_y = y;
-        prev_bulge = bulge;
+        prev_x = x; prev_y = y; prev_z = z; prev_bulge = bulge;
         have_prev = 1;
     }
     if (dwg_polyline_is_closed(pl) && have_prev)
-    {
-        if (prev_bulge != 0.0)
-        {
-            double dx = fx - prev_x;
-            double dy = fy - prev_y;
-            double chord = sqrt(dx * dx + dy * dy);
-            if (chord > 1.0e-9)
-            {
-                double included = 4.0 * atan(prev_bulge);
-                double sagitta = (chord / 2.0) * prev_bulge;
-                double perp_x = -dy / chord;
-                double perp_y = dx / chord;
-                double mid_x = (prev_x + fx) / 2.0;
-                double mid_y = (prev_y + fy) / 2.0;
-                double radius = chord / (2.0 * fabs(sin(included / 2.0)));
-                double cx = mid_x + perp_x * (radius - sagitta);
-                double cy = mid_y + perp_y * (radius - sagitta);
-                double start_angle = atan2(prev_y - cy, prev_x - cx);
-                double end_angle = atan2(fy - cy, fx - cx);
-                double sweep = end_angle - start_angle;
-                unsigned long n, s;
+        draw_bulge_segment(rc, prev_x, prev_y, prev_z, fx, fy, fz, prev_bulge);
 
-                if (prev_bulge > 0.0) { while (sweep <= 0.0) sweep += 2.0 * M_PI; }
-                else                  { while (sweep >= 0.0) sweep -= 2.0 * M_PI; }
-
-                n = segment_count_for_sweep(sweep);
-                for (s = 1UL; s <= n; s++)
-                {
-                    double a = start_angle + sweep * ((double)s / (double)n);
-                    double ax = cx + radius * cos(a);
-                    double ay = cy + radius * sin(a);
-                    draw_segment(rc, prev_x, prev_y, ax, ay);
-                    prev_x = ax; prev_y = ay;
-                }
-            }
-            else
-            {
-                draw_segment(rc, prev_x, prev_y, fx, fy);
-            }
-        }
-        else
-        {
-            draw_segment(rc, prev_x, prev_y, fx, fy);
-        }
-    }
+    first = dwg_polyline_first_vertex(pl); /* silence unused-var warning on some paths */
+    (void)first;
 }
 
 static void draw_solid(const DWG_RENDER_CTX *rc, HENTITY e)
@@ -405,11 +478,33 @@ static void draw_solid(const DWG_RENDER_CTX *rc, HENTITY e)
     if (g == NULL) return;
     /* DXF/DWG SOLID winding is p1-p2-p4-p3 (a real quirk -- p3/p4 are
        swapped relative to a naive quad walk, otherwise this bowties). */
-    world_to_pixel(rc, g->p1.x, g->p1.y, &pts[0].x, &pts[0].y);
-    world_to_pixel(rc, g->p2.x, g->p2.y, &pts[1].x, &pts[1].y);
-    world_to_pixel(rc, g->p4.x, g->p4.y, &pts[2].x, &pts[2].y);
-    world_to_pixel(rc, g->p3.x, g->p3.y, &pts[3].x, &pts[3].y);
+    world_to_pixel(rc, g->p1.x, g->p1.y, g->p1.z, &pts[0].x, &pts[0].y);
+    world_to_pixel(rc, g->p2.x, g->p2.y, g->p2.z, &pts[1].x, &pts[1].y);
+    world_to_pixel(rc, g->p4.x, g->p4.y, g->p4.z, &pts[2].x, &pts[2].y);
+    world_to_pixel(rc, g->p3.x, g->p3.y, g->p3.z, &pts[3].x, &pts[3].y);
     Polygon(rc->hdc, pts, 4);
+}
+
+/*
+ * 3DFACE: dibuja las 4 aristas como wireframe (SIN relleno -- el
+ * ordenamiento de profundidad para caras rellenas queda para una vuelta
+ * futura, ver plan de navegacion 3D). edge_flags respeta el bit-por-
+ * arista de invisibilidad (DXF 70: 1=arista1,2=arista2,4=arista3,
+ * 8=arista4) para no mostrar las diagonales internas de triangulacion
+ * que AutoCAD agrega cuando una cara es en realidad un triangulo
+ * (point4==point3) partido en dos.
+ */
+static void draw_face(const DWG_RENDER_CTX *rc, HENTITY e)
+{
+    DWG_FACE3D *g = (DWG_FACE3D *)e->geometry;
+    unsigned short flags;
+    if (g == NULL) return;
+    flags = dwg_face_get_edge_flags(e);
+
+    if (!(flags & 1U)) draw_segment(rc, g->p1.x, g->p1.y, g->p1.z, g->p2.x, g->p2.y, g->p2.z);
+    if (!(flags & 2U)) draw_segment(rc, g->p2.x, g->p2.y, g->p2.z, g->p3.x, g->p3.y, g->p3.z);
+    if (!(flags & 4U)) draw_segment(rc, g->p3.x, g->p3.y, g->p3.z, g->p4.x, g->p4.y, g->p4.z);
+    if (!(flags & 8U)) draw_segment(rc, g->p4.x, g->p4.y, g->p4.z, g->p1.x, g->p1.y, g->p1.z);
 }
 
 /*
@@ -427,7 +522,7 @@ static void draw_solid(const DWG_RENDER_CTX *rc, HENTITY e)
 #define DWG_HATCH_ARC_SEGMENTS 16UL
 
 static void append_bulge_arc(const DWG_RENDER_CTX *rc, POINT *pts, unsigned long *pi,
-                             double x1, double y1, double x2, double y2, double bulge)
+                             double x1, double y1, double z1, double x2, double y2, double z2, double bulge)
 {
     double dx = x2 - x1;
     double dy = y2 - y1;
@@ -453,15 +548,22 @@ static void append_bulge_arc(const DWG_RENDER_CTX *rc, POINT *pts, unsigned long
     end_angle = atan2(y2 - cy, x2 - cx);
 
     sweep = end_angle - start_angle;
-    if (bulge > 0.0) { while (sweep <= 0.0) sweep += 2.0 * M_PI; }
-    else             { while (sweep >= 0.0) sweep -= 2.0 * M_PI; }
+    /* fmod-based, O(1) normalization -- same defensive fix as
+       draw_arc's/draw_bulge_segment's own sweep normalization,
+       applied here too rather than leaving this one unbounded loop
+       as the odd one out. */
+    sweep = fmod(sweep, 2.0 * M_PI);
+    if (bulge > 0.0) { if (sweep <= 0.0) sweep += 2.0 * M_PI; }
+    else             { if (sweep >= 0.0) sweep -= 2.0 * M_PI; }
 
     for (s = 1UL; s < DWG_HATCH_ARC_SEGMENTS; s++)
     {
-        double a = start_angle + sweep * ((double)s / (double)DWG_HATCH_ARC_SEGMENTS);
+        double frac = (double)s / (double)DWG_HATCH_ARC_SEGMENTS;
+        double a = start_angle + sweep * frac;
         double x = cx + radius * cos(a);
         double y = cy + radius * sin(a);
-        world_to_pixel(rc, x, y, &pts[*pi].x, &pts[*pi].y);
+        double z = z1 + (z2 - z1) * frac;
+        world_to_pixel(rc, x, y, z, &pts[*pi].x, &pts[*pi].y);
         (*pi)++;
     }
 }
@@ -471,7 +573,7 @@ static void draw_hatch(const DWG_RENDER_CTX *rc, HENTITY e)
     HVERTEX v;
     unsigned long count, i;
     POINT *pts;
-    double prev_x = 0.0, prev_y = 0.0, prev_bulge = 0.0;
+    double prev_x = 0.0, prev_y = 0.0, prev_z = 0.0, prev_bulge = 0.0;
     int have_prev = 0;
 
     count = dwg_hatch_boundary_count(e);
@@ -494,13 +596,13 @@ static void draw_hatch(const DWG_RENDER_CTX *rc, HENTITY e)
         bulge = dwg_vertex_get_bulge(v);
 
         if (have_prev && prev_bulge != 0.0)
-            append_bulge_arc(rc, pts, &i, prev_x, prev_y, x, y, prev_bulge);
+            append_bulge_arc(rc, pts, &i, prev_x, prev_y, prev_z, x, y, z, prev_bulge);
 
-        world_to_pixel(rc, x, y, &pts[i].x, &pts[i].y);
+        world_to_pixel(rc, x, y, z, &pts[i].x, &pts[i].y);
         i++;
 
         have_prev = 1;
-        prev_x = x; prev_y = y; prev_bulge = bulge;
+        prev_x = x; prev_y = y; prev_z = z; prev_bulge = bulge;
     }
 
     /* closing segment (last vertex -> first vertex): Polygon() draws
@@ -513,7 +615,7 @@ static void draw_hatch(const DWG_RENDER_CTX *rc, HENTITY e)
         if (first_v != NULL)
         {
             dwg_vertex_get_point(first_v, &fx, &fy, &fz);
-            append_bulge_arc(rc, pts, &i, prev_x, prev_y, fx, fy, prev_bulge);
+            append_bulge_arc(rc, pts, &i, prev_x, prev_y, prev_z, fx, fy, fz, prev_bulge);
         }
     }
 
@@ -535,33 +637,72 @@ static void draw_hatch(const DWG_RENDER_CTX *rc, HENTITY e)
  * by Arturo after this file's binary TEXT/MTEXT support first went in
  * ("los numeros se leen pero estan desplazados").
  */
-static void draw_text_string(const DWG_RENDER_CTX *rc, double x, double y, double angle_deg,
+/*
+ * Resuelve la fuente REAL de un TEXT via su estilo (pedido de Arturo
+ * 2026-08-26, "agregar funcion para escribir texto definiendo el tipo
+ * de letra y tamaño") -- BUG REAL encontrado de paso: draw_text_string
+ * tenia "Arial" literal, sin importar el estilo real de la entidad, asi
+ * que la tabla STYLE (dwg_style.h, con font_name ya modelado y get/set
+ * completos desde el reverse original) nunca se consultaba para nada.
+ * Sin style_name o sin encontrar el estilo o con font_name vacio, cae a
+ * "Arial" -- mismo comportamiento de siempre para cualquier TEXT sin
+ * fuente propia asignada, no rompe nada de lo que ya andaba.
+ */
+static const char *resolve_text_font(HDWG hDwg, HENTITY e)
+{
+    const char *style_name;
+    HSTYLE style;
+    const char *font;
+
+    if (hDwg == NULL)
+        return "Arial";
+
+    style_name = dwg_text_get_style_name(e);
+    if (style_name == NULL || style_name[0] == '\0')
+        return "Arial";
+
+    style = dwg_document_get_style(hDwg, style_name);
+    if (style == NULL)
+        return "Arial";
+
+    font = dwg_style_get_font(style);
+    if (font == NULL || font[0] == '\0')
+        return "Arial";
+
+    return font;
+}
+
+static void draw_text_string(const DWG_RENDER_CTX *rc, double x, double y, double z, double angle_deg,
                              double height_world, const char *text, UINT valign, UINT halign,
-                             double width_factor, int backward, const char *font_name)
+                             const char *font_name)
 {
     LONG px, py;
-    LONG height_px, width_px;
+    LONG height_px;
     HFONT hFont, hOldFont;
     int old_bk;
     UINT old_align;
-    const char *face = (font_name != NULL && font_name[0] != '\0') ? font_name : "Arial";
 
     if (text == NULL || text[0] == '\0')
         return;
 
-    world_to_pixel(rc, x, y, &px, &py);
+    if (font_name == NULL || font_name[0] == '\0')
+        font_name = "Arial";
+
+    world_to_pixel(rc, x, y, z, &px, &py);
     height_px = (LONG)(height_world / rc->scale + 0.5);
     if (height_px < 1) height_px = 1;
 
-    /* lfWidth: average character width in logical units. Negative = mirrored
-       (backward text). width_factor of 1.0 means standard aspect ratio. */
-    width_px = (LONG)(height_px * width_factor + 0.5);
-    if (backward)
-        width_px = -width_px;
-
-    hFont = CreateFontA(-height_px, width_px, (LONG)(angle_deg * 10.0 + 0.5), (LONG)(angle_deg * 10.0 + 0.5),
+    /* NOT YET VISUALLY VERIFIED: GDI's lfEscapement is documented as
+       "counterclockwise from the x-axis" but real-world behavior under
+       a manually Y-flipped mapping (our case -- we compute device
+       pixels ourselves per point, GDI never sees our world coordinate
+       system) is a known source of sign confusion. Passing angle_deg
+       directly here is a reasonable first guess, not a confirmed
+       result -- check real rotated text on screen once the viewer is
+       actually running, and negate here if it spins the wrong way. */
+    hFont = CreateFontA(-height_px, 0, (LONG)(angle_deg * 10.0 + 0.5), (LONG)(angle_deg * 10.0 + 0.5),
                         FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
-                        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
+                        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, font_name);
     hOldFont = (HFONT)SelectObject(rc->hdc, hFont);
     old_bk = SetBkMode(rc->hdc, TRANSPARENT);
     old_align = SetTextAlign(rc->hdc, valign | halign);
@@ -574,125 +715,12 @@ static void draw_text_string(const DWG_RENDER_CTX *rc, double x, double y, doubl
     DeleteObject(hFont);
 }
 
-/* SHX-to-Windows font name mapping table. Common AutoCAD SHX fonts
-   mapped to their closest Windows GDI equivalents. */
-typedef struct { const char *shx; const char *win; } shx_map_entry;
-static const shx_map_entry shx_map[] = {
-    { "romans.shx",    "RomanS" },
-    { "romand.shx",    "RomanD" },
-    { "romant.shx",    "RomanT" },
-    { "simplex.shx",   "Simplex" },
-    { "complex.shx",   "Complex" },
-    { "hztxt.shx",     "SimSun" },
-    { "hztxtf.shx",    "SimSun" },
-    { "txt.shx",       "Txt" },
-    { "txt64.shx",     "Txt" },
-    { "isoct.shx",     "ISOCPEUR" },
-    { "isoct2.shx",    "ISOCPEUR" },
-    { "isocp.shx",     "ISOCPEUR" },
-    { "isocp1.shx",    "ISOCPEUR" },
-    { "isocp2.shx",    "ISOCPEUR" },
-    { "isocp3.shx",    "ISOCPEUR" },
-    { "isosceur.shx",  "ISOCPEUR" },
-    { "gothic.shx",    "GothicE" },
-    { "gothice.shx",   "GothicE" },
-    { "gothicg.shx",   "GothicG" },
-    { "gothici.shx",   "GothicI" },
-    { "syastro.shx",   "Symbol" },
-    { "symap.shx",     "Symbol" },
-    { "symath.shx",    "Symbol" },
-    { "gdt.shx",       "GDT" },
-    { "gdtext.shx",    "GDT" },
-    { "italic.shx",    "Italic" },
-    { "italicc.shx",   "Italic" },
-    { "italict.shx",   "Italic" },
-    { "monotxt.shx",   "Courier New" },
-    { "monotxt.shx",   "Courier New" },
-    { "cour.shx",      "Courier New" },
-    { "courier.shx",   "Courier New" },
-    { "arial.shx",     "Arial" },
-    { "arial.ttf",     "Arial" },
-    { "times.shx",     "Times New Roman" },
-    { "times.ttf",     "Times New Roman" },
-    { "verdana.shx",   "Verdana" },
-    { "verdana.ttf",   "Verdana" },
-    { "tahoma.shx",    "Tahoma" },
-    { "tahoma.ttf",    "Tahoma" },
-    { NULL, NULL }
-};
-
-/* Map an SHX filename to a Windows GDI face name. Returns the GDI
-   face name if found, otherwise returns the original name unchanged. */
-static const char *shx_to_win_font(const char *name)
-{
-    int i;
-    const char *dot;
-
-    if (name == NULL || name[0] == '\0')
-        return name;
-
-    /* Check if it's an SHX file (ends in .shx or .SHX) */
-    dot = strrchr(name, '.');
-    if (dot != NULL && (strcmp(dot, ".shx") == 0 || strcmp(dot, ".SHX") == 0 ||
-                        strcmp(dot, ".SHX") == 0))
-    {
-        for (i = 0; shx_map[i].shx != NULL; i++)
-        {
-            if (_stricmp(name, shx_map[i].shx) == 0)
-                return shx_map[i].win;
-        }
-        /* Unknown SHX: strip extension and return bare name as last resort */
-    }
-
-    return name;
-}
-
-/* Look up the best Windows font face name for an entity's STYLE.
-   Priority: ttf_name (group 4, usually a real TTF) > font_name (group 3,
-   may be SHX) mapped through shx_to_win_font. Returns the face name
-   string or NULL if nothing usable is found. */
-static const char *resolve_entity_font(const DWG_RENDER_CTX *rc, const char *style_name)
-{
-    HSTYLE style;
-    const char *ttf, *font;
-
-    if (rc->hDwg == NULL || style_name == NULL || style_name[0] == '\0')
-        return NULL;
-
-    style = dwg_document_get_style(rc->hDwg, style_name);
-    if (style == NULL)
-        return NULL;
-
-    /* Prefer TTF name (group 4) -- it's usually a real Windows font */
-    ttf = dwg_style_get_ttf_name(style);
-    if (ttf != NULL && ttf[0] != '\0')
-    {
-        /* Strip .ttf extension if present */
-        const char *dot = strrchr(ttf, '.');
-        if (dot != NULL && (_stricmp(dot, ".ttf") == 0 || _stricmp(dot, ".TTF") == 0))
-        {
-            /* Can't modify in-place, but CreateFontA handles .ttf names too */
-        }
-        return ttf;
-    }
-
-    /* Fall back to primary font (group 3), mapping SHX -> Windows name */
-    font = dwg_style_get_font(style);
-    if (font != NULL && font[0] != '\0')
-        return shx_to_win_font(font);
-
-    return NULL;
-}
-
 static void draw_text(const DWG_RENDER_CTX *rc, HENTITY e)
 {
     double x, y, z;
-    const char *font = resolve_entity_font(rc, dwg_text_get_style_name(e));
     dwg_text_get_point(e, &x, &y, &z);
-    draw_text_string(rc, x, y, dwg_text_get_angle(e), dwg_text_get_height(e), dwg_text_get_text(e),
-                     TA_BASELINE, TA_LEFT,
-                     dwg_text_get_width_factor(e),
-                     dwg_text_get_backward(e) ? 1 : 0, font);
+    draw_text_string(rc, x, y, z, dwg_text_get_angle(e), dwg_text_get_height(e), dwg_text_get_text(e),
+                     TA_BASELINE, TA_LEFT, resolve_text_font(rc->hDwg, e));
 }
 
 /*
@@ -731,90 +759,107 @@ static void draw_mtext(const DWG_RENDER_CTX *rc, HENTITY e)
     default: break; /* top row: anchor as-is */
     }
 
-    draw_text_string(rc, x, y, dwg_mtext_get_angle(e), height_world, dwg_mtext_get_text(e), valign, halign,
-                     1.0, 0, resolve_entity_font(rc, dwg_mtext_get_style_name(e)));
+    /* MTEXT no tiene un campo de estilo/fuente propio modelado todavia
+       (a diferencia de TEXT, ver resolve_text_font arriba) -- sigue en
+       "Arial" fijo, fuera de alcance esta vuelta (documentado, no
+       accidental). */
+    draw_text_string(rc, x, y, z, 0.0, height_world, dwg_mtext_get_text(e), valign, halign, "Arial");
+}
+
+/* Tamaño fijo en unidades de mundo para flechas/texto de cota -- NO
+   consume la tabla DIMSTYLE ya armada (dwg_dimstyle.h) pero inerte,
+   simplificacion deliberada de esta vuelta (pedido de Arturo
+   2026-08-26, "permitir colocar cotas" -- ver el plan). */
+#define DWG_DIM_ARROW_LEN   2.5
+#define DWG_DIM_TEXT_HEIGHT 2.5
+
+/* Flecha rellena de una cota: la punta toca (tipx,tipy) y la base se
+   abre hacia adentro en la direccion (dirx,diry) -- mismo primitivo
+   Polygon() que draw_solid ya usa para un relleno. */
+static void draw_dimension_arrow(const DWG_RENDER_CTX *rc, double tipx, double tipy, double z,
+                                 double dirx, double diry)
+{
+    double basex = tipx + dirx * DWG_DIM_ARROW_LEN;
+    double basey = tipy + diry * DWG_DIM_ARROW_LEN;
+    double perpx = -diry, perpy = dirx;
+    double halfw = DWG_DIM_ARROW_LEN * 0.3;
+    POINT pts[3];
+
+    world_to_pixel(rc, tipx, tipy, z, &pts[0].x, &pts[0].y);
+    world_to_pixel(rc, basex + perpx * halfw, basey + perpy * halfw, z, &pts[1].x, &pts[1].y);
+    world_to_pixel(rc, basex - perpx * halfw, basey - perpy * halfw, z, &pts[2].x, &pts[2].y);
+    Polygon(rc->hdc, pts, 3);
 }
 
 /*
- * ELLIPSE: parametric tessellation into line segments.
- * DWG stores: center, major_axis_endpoint (vector from center to major
- * axis end), axis_ratio (minor/major), start_param/end_param (radians,
- * 0..2PI for a full ellipse). The parametric form is:
- *   P(t) = center + cos(t) * major_axis + sin(t) * axis_ratio * major_axis
- * where major_axis = (major_axis_endpoint - center).
+ * Regenera las lineas de extension + la linea de cota via proyeccion
+ * perpendicular de def_pt contra la direccion xline1->xline2 -- MISMA
+ * formula ya escrita y verificada (Arturo la confirmo visualmente en
+ * su momento) en bridge_dimension() de dwg_libredwg_bridge.c (lineas
+ * 1246-1263), reusada tal cual aca (y otra vez en dwg_transform.c's
+ * explode). El texto muestra Distancia(xline1,xline2) formateada con 2
+ * decimales, centrado sobre la linea de cota.
  */
-static void draw_ellipse(const DWG_RENDER_CTX *rc, HENTITY e)
+static void draw_dimension(const DWG_RENDER_CTX *rc, HENTITY e)
 {
-    DWG_ELLIPSE3D *g = (DWG_ELLIPSE3D *)e->geometry;
-    double mx, my, nx, ny;
-    double start, end, sweep;
-    unsigned long n, i;
-    double prev_x, prev_y;
+    DWG_DIMENSION3D *g = (DWG_DIMENSION3D *)e->geometry;
+    double dx, dy, dist, dirx, diry, perpx, perpy;
+    double def_perp, xl1_perp, xl2_perp, delta1, delta2;
+    double dl1x, dl1y, dl2x, dl2y, midx, midy, angle_deg;
+    char text[32];
 
     if (g == NULL) return;
 
-    mx = g->major_axis_endpoint.x - g->center.x;
-    my = g->major_axis_endpoint.y - g->center.y;
-    nx = -my * g->axis_ratio;
-    ny =  mx * g->axis_ratio;
+    dx = g->xline2.x - g->xline1.x;
+    dy = g->xline2.y - g->xline1.y;
+    dist = sqrt(dx * dx + dy * dy);
+    if (dist < 1.0e-9) { dirx = 1.0; diry = 0.0; } else { dirx = dx / dist; diry = dy / dist; }
+    perpx = -diry; perpy = dirx;
 
-    start = g->start_param;
-    end = g->end_param;
-    sweep = end - start;
-    if (sweep <= 0.0) sweep += 2.0 * M_PI;
+    def_perp = g->def_pt.x * perpx + g->def_pt.y * perpy;
+    xl1_perp = g->xline1.x * perpx + g->xline1.y * perpy;
+    xl2_perp = g->xline2.x * perpx + g->xline2.y * perpy;
+    delta1 = def_perp - xl1_perp;
+    delta2 = def_perp - xl2_perp;
+    dl1x = g->xline1.x + delta1 * perpx; dl1y = g->xline1.y + delta1 * perpy;
+    dl2x = g->xline2.x + delta2 * perpx; dl2y = g->xline2.y + delta2 * perpy;
 
-    n = segment_count_for_sweep(sweep);
-    prev_x = g->center.x + mx * cos(start) + nx * sin(start);
-    prev_y = g->center.y + my * cos(start) + ny * sin(start);
+    draw_segment(rc, g->xline1.x, g->xline1.y, g->xline1.z, dl1x, dl1y, g->xline1.z);
+    draw_segment(rc, g->xline2.x, g->xline2.y, g->xline2.z, dl2x, dl2y, g->xline2.z);
+    draw_segment(rc, dl1x, dl1y, g->xline1.z, dl2x, dl2y, g->xline2.z);
 
-    for (i = 1UL; i <= n; i++)
-    {
-        double t = start + sweep * ((double)i / (double)n);
-        double px = g->center.x + mx * cos(t) + nx * sin(t);
-        double py = g->center.y + my * cos(t) + ny * sin(t);
-        draw_segment(rc, prev_x, prev_y, px, py);
-        prev_x = px; prev_y = py;
-    }
+    draw_dimension_arrow(rc, dl1x, dl1y, g->xline1.z, dirx, diry);
+    draw_dimension_arrow(rc, dl2x, dl2y, g->xline2.z, -dirx, -diry);
+
+    midx = (dl1x + dl2x) / 2.0;
+    midy = (dl1y + dl2y) / 2.0;
+    angle_deg = atan2(diry, dirx) * 180.0 / M_PI;
+
+    sprintf(text, "%.2f", dist);
+    draw_text_string(rc, midx, midy, g->xline1.z, angle_deg, DWG_DIM_TEXT_HEIGHT, text, TA_BOTTOM, TA_CENTER, "Arial");
 }
 
-/* 3DFACE: same geometry as SOLID, drawn as a filled quad. */
-static void draw_face(const DWG_RENDER_CTX *rc, HENTITY e)
+/*
+ * dwg_render.c nunca habia consultado el estado off/frozen de la capa
+ * de una entidad (grep confirmado: cero referencias a dwg_layer_is_off/
+ * is_frozen antes de esto) -- una capa apagada o congelada desde el
+ * dialogo de Capas (dwg_layers_dlg.prg, pedido de Arturo 2026-08-26)
+ * seguia dibujandose igual. Sin capa registrada para el nombre de la
+ * entidad, visible por defecto (mismo comportamiento que siempre hubo).
+ */
+static int entity_layer_visible(HDWG hDwg, HENTITY e)
 {
-    DWG_FACE3D *g = (DWG_FACE3D *)e->geometry;
-    POINT pts[4];
-    if (g == NULL) return;
-    world_to_pixel(rc, g->p1.x, g->p1.y, &pts[0].x, &pts[0].y);
-    world_to_pixel(rc, g->p2.x, g->p2.y, &pts[1].x, &pts[1].y);
-    world_to_pixel(rc, g->p3.x, g->p3.y, &pts[2].x, &pts[2].y);
-    world_to_pixel(rc, g->p4.x, g->p4.y, &pts[3].x, &pts[3].y);
-    Polygon(rc->hdc, pts, 4);
-}
+    HLAYER lay = dwg_document_get_layer(hDwg, dwg_entity_get_layer(e));
 
-static void draw_leader(const DWG_RENDER_CTX *rc, HENTITY e)
-{
-    HVERTEX v;
-    double px, py, pz;
-    double prev_x, prev_y;
-    int first = 1;
+    if (lay == NULL)
+        return 1;
 
-    for (v = dwg_leader_first_vertex(e); v != NULL; v = dwg_leader_next_vertex(v))
-    {
-        dwg_vertex_get_point(v, &px, &py, &pz);
-        if (first)
-        {
-            prev_x = px; prev_y = py;
-            first = 0;
-        }
-        else
-        {
-            draw_segment(rc, prev_x, prev_y, px, py);
-            prev_x = px; prev_y = py;
-        }
-    }
+    return !(dwg_layer_is_off(lay) || dwg_layer_is_frozen(lay));
 }
 
 void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
-                       double scale, double origin_x, double origin_y)
+                       double scale, double origin_x, double origin_y,
+                       const DWG_CAMERA3D *camera)
 {
     HDC hdc = (HDC)hdc_v;
     DWG_RENDER_CTX rc;
@@ -833,10 +878,11 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
     DeleteObject(bg_brush);
 
     rc.hdc = hdc;
-    rc.hDwg = hDwg;
     rc.scale = scale;
     rc.origin_x = origin_x;
     rc.origin_y = origin_y;
+    rc.camera = camera;
+    rc.hDwg = hDwg;
     rc.pen_valid = 0;
     rc.pen_color = 0;
     rc.pen = NULL;
@@ -852,9 +898,30 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
     old_brush = (HBRUSH)SelectObject(hdc, GetStockObject(WHITE_BRUSH));
     SetTextColor(hdc, RGB(255, 255, 255));
 
+    /* REVERTIDO 2026-08-26: un relleno con ordenamiento pintor (segunda
+       pasada de SOLID/FACE ordenada por profundidad de camara, con
+       Polygon() relleno en vez de solo aristas) se probo y Arturo lo
+       confirmo visualmente MAL ("no se ve correcto, deberia verse con
+       estructura alambrica") -- con cientos de 3DFACE chicos (paredes/
+       piso) cada uno con su propio color de capa, el resultado real fue
+       una maraña de parches de color en vez de una estructura
+       reconocible, muy distinto del wireframe simple ya confirmado
+       funcionando antes de ese intento (ver memoria para el detalle
+       completo, codigo removido del todo aca, no solo comentado). Un
+       unico pase, FACE siempre en alambre (draw_face) sin importar el
+       modo, igual que SOLID siempre relleno (asi era desde antes de
+       toda esta sesion, sin cambios). */
     for (e = dwg_document_first_entity(hDwg); e != NULL; e = dwg_document_next_entity(e))
     {
-        unsigned short color = dwg_entity_get_color(e);
+        unsigned short color;
+
+        if (!entity_layer_visible(hDwg, e))
+            continue;
+
+        /* seleccion actual (dwg_document_sel_contains) se resalta con un
+           color fijo en vez del real de la entidad -- ver
+           DWG_RENDER_SELECTED_PSEUDO_COLOR arriba */
+        color = dwg_document_sel_contains(hDwg, e) ? DWG_RENDER_SELECTED_PSEUDO_COLOR : dwg_entity_get_color(e);
         set_pen_for_color(&rc, color);
 
         switch (dwg_entity_get_type(e))
@@ -868,9 +935,8 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
         case DWG_ENTITY_HATCH:    set_brush_for_color(&rc, color); draw_hatch(&rc, e); break;
         case DWG_ENTITY_TEXT:     draw_text(&rc, e); break;
         case DWG_ENTITY_MTEXT:    draw_mtext(&rc, e); break;
-        case DWG_ENTITY_ELLIPSE:  draw_ellipse(&rc, e); break;
-        case DWG_ENTITY_FACE:     set_brush_for_color(&rc, color); draw_face(&rc, e); break;
-        case DWG_ENTITY_LEADER:   draw_leader(&rc, e); break;
+        case DWG_ENTITY_FACE:     draw_face(&rc, e); break;
+        case DWG_ENTITY_DIMENSION: set_brush_for_color(&rc, color); draw_dimension(&rc, e); break;
         default: break; /* anything else: not modeled, see dwg_render.h */
         }
     }
@@ -977,42 +1043,18 @@ long dwg_render_get_extents(HDWG hDwg, double *min_x, double *min_y,
             DWG_RENDER_EXTEND(x, y);
             break;
         }
-        case DWG_ENTITY_ELLIPSE:
+        case DWG_ENTITY_DIMENSION:
         {
-            DWG_ELLIPSE3D *g = (DWG_ELLIPSE3D *)e->geometry;
+            /* conservador: extiende por los 3 puntos crudos (xline1/
+               xline2/def_pt), no por las lineas de cota derivadas --
+               mismo criterio que ARC ya usa (bound by the full circle
+               rather than the real sweep). */
+            DWG_DIMENSION3D *g = (DWG_DIMENSION3D *)e->geometry;
             if (g != NULL)
             {
-                /* conservative: bound by the major+minor axes extents */
-                double major_len = sqrt((g->major_axis_endpoint.x - g->center.x) *
-                                        (g->major_axis_endpoint.x - g->center.x) +
-                                        (g->major_axis_endpoint.y - g->center.y) *
-                                        (g->major_axis_endpoint.y - g->center.y));
-                double minor_len = major_len * g->axis_ratio;
-                DWG_RENDER_EXTEND(g->center.x - major_len, g->center.y - major_len);
-                DWG_RENDER_EXTEND(g->center.x + major_len, g->center.y + major_len);
-                DWG_RENDER_EXTEND(g->center.x - minor_len, g->center.y - minor_len);
-                DWG_RENDER_EXTEND(g->center.x + minor_len, g->center.y + minor_len);
-            }
-            break;
-        }
-        case DWG_ENTITY_FACE:
-        {
-            DWG_FACE3D *g = (DWG_FACE3D *)e->geometry;
-            if (g != NULL)
-            {
-                DWG_RENDER_EXTEND(g->p1.x, g->p1.y); DWG_RENDER_EXTEND(g->p2.x, g->p2.y);
-                DWG_RENDER_EXTEND(g->p3.x, g->p3.y); DWG_RENDER_EXTEND(g->p4.x, g->p4.y);
-            }
-            break;
-        }
-        case DWG_ENTITY_LEADER:
-        {
-            HVERTEX v;
-            for (v = dwg_leader_first_vertex(e); v != NULL; v = dwg_leader_next_vertex(v))
-            {
-                double vx, vy, vz;
-                dwg_vertex_get_point(v, &vx, &vy, &vz);
-                DWG_RENDER_EXTEND(vx, vy);
+                DWG_RENDER_EXTEND(g->xline1.x, g->xline1.y);
+                DWG_RENDER_EXTEND(g->xline2.x, g->xline2.y);
+                DWG_RENDER_EXTEND(g->def_pt.x, g->def_pt.y);
             }
             break;
         }
@@ -1023,11 +1065,136 @@ long dwg_render_get_extents(HDWG hDwg, double *min_x, double *min_y,
 #undef DWG_RENDER_EXTEND
 
     if (!have_any)
-    {
-        *min_x = 0.0; *min_y = 0.0; *max_x = 0.0; *max_y = 0.0;
         return 0L;
-    }
 
     *min_x = lo_x; *min_y = lo_y; *max_x = hi_x; *max_y = hi_y;
+    return 1L;
+}
+
+long dwg_render_get_extents_3d(HDWG hDwg, double *min_x, double *min_y, double *min_z,
+                               double *max_x, double *max_y, double *max_z)
+{
+    HENTITY e;
+    int have_any = 0;
+    double lo_x = 0.0, lo_y = 0.0, lo_z = 0.0, hi_x = 0.0, hi_y = 0.0, hi_z = 0.0;
+
+#define DWG_RENDER_EXTEND3(px, py, pz) \
+    do { \
+        if (!have_any) { lo_x = hi_x = (px); lo_y = hi_y = (py); lo_z = hi_z = (pz); have_any = 1; } \
+        else { \
+            if ((px) < lo_x) lo_x = (px); if ((px) > hi_x) hi_x = (px); \
+            if ((py) < lo_y) lo_y = (py); if ((py) > hi_y) hi_y = (py); \
+            if ((pz) < lo_z) lo_z = (pz); if ((pz) > hi_z) hi_z = (pz); \
+        } \
+    } while (0)
+
+    if (hDwg == NULL)
+        return 0L;
+
+    for (e = dwg_document_first_entity(hDwg); e != NULL; e = dwg_document_next_entity(e))
+    {
+        switch (dwg_entity_get_type(e))
+        {
+        case DWG_ENTITY_LINE:
+        {
+            DWG_LINE3D *g = (DWG_LINE3D *)e->geometry;
+            if (g != NULL) { DWG_RENDER_EXTEND3(g->start.x, g->start.y, g->start.z); DWG_RENDER_EXTEND3(g->end.x, g->end.y, g->end.z); }
+            break;
+        }
+        case DWG_ENTITY_CIRCLE:
+        {
+            DWG_CIRCLE3D *g = (DWG_CIRCLE3D *)e->geometry;
+            if (g != NULL)
+            {
+                DWG_RENDER_EXTEND3(g->center.x - g->radius, g->center.y - g->radius, g->center.z);
+                DWG_RENDER_EXTEND3(g->center.x + g->radius, g->center.y + g->radius, g->center.z);
+            }
+            break;
+        }
+        case DWG_ENTITY_ARC:
+        {
+            DWG_ARC3D *g = (DWG_ARC3D *)e->geometry;
+            if (g != NULL)
+            {
+                DWG_RENDER_EXTEND3(g->center.x - g->radius, g->center.y - g->radius, g->center.z);
+                DWG_RENDER_EXTEND3(g->center.x + g->radius, g->center.y + g->radius, g->center.z);
+            }
+            break;
+        }
+        case DWG_ENTITY_POINT:
+        {
+            DWG_POINT3D *g = (DWG_POINT3D *)e->geometry;
+            if (g != NULL) DWG_RENDER_EXTEND3(g->x, g->y, g->z);
+            break;
+        }
+        case DWG_ENTITY_POLYLINE:
+        {
+            HPOLYLINE pl = dwg_polyline_from_entity(e);
+            HVERTEX v;
+            if (pl != NULL)
+                for (v = dwg_polyline_first_vertex(pl); v != NULL; v = dwg_polyline_next_vertex(v))
+                {
+                    double x, y, z;
+                    dwg_vertex_get_point(v, &x, &y, &z);
+                    DWG_RENDER_EXTEND3(x, y, z);
+                }
+            break;
+        }
+        case DWG_ENTITY_SOLID:
+        {
+            DWG_SOLID3D *g = (DWG_SOLID3D *)e->geometry;
+            if (g != NULL)
+            {
+                DWG_RENDER_EXTEND3(g->p1.x, g->p1.y, g->p1.z); DWG_RENDER_EXTEND3(g->p2.x, g->p2.y, g->p2.z);
+                DWG_RENDER_EXTEND3(g->p3.x, g->p3.y, g->p3.z); DWG_RENDER_EXTEND3(g->p4.x, g->p4.y, g->p4.z);
+            }
+            break;
+        }
+        case DWG_ENTITY_FACE:
+        {
+            DWG_FACE3D *g = (DWG_FACE3D *)e->geometry;
+            if (g != NULL)
+            {
+                DWG_RENDER_EXTEND3(g->p1.x, g->p1.y, g->p1.z); DWG_RENDER_EXTEND3(g->p2.x, g->p2.y, g->p2.z);
+                DWG_RENDER_EXTEND3(g->p3.x, g->p3.y, g->p3.z); DWG_RENDER_EXTEND3(g->p4.x, g->p4.y, g->p4.z);
+            }
+            break;
+        }
+        case DWG_ENTITY_TEXT:
+        {
+            double x, y, z;
+            dwg_text_get_point(e, &x, &y, &z);
+            DWG_RENDER_EXTEND3(x, y, z);
+            break;
+        }
+        case DWG_ENTITY_MTEXT:
+        {
+            double x, y, z;
+            dwg_mtext_get_point(e, &x, &y, &z);
+            DWG_RENDER_EXTEND3(x, y, z);
+            break;
+        }
+        case DWG_ENTITY_DIMENSION:
+        {
+            DWG_DIMENSION3D *g = (DWG_DIMENSION3D *)e->geometry;
+            if (g != NULL)
+            {
+                DWG_RENDER_EXTEND3(g->xline1.x, g->xline1.y, g->xline1.z);
+                DWG_RENDER_EXTEND3(g->xline2.x, g->xline2.y, g->xline2.z);
+                DWG_RENDER_EXTEND3(g->def_pt.x, g->def_pt.y, g->def_pt.z);
+            }
+            break;
+        }
+        default: break;
+        }
+    }
+
+#undef DWG_RENDER_EXTEND3
+
+    if (!have_any)
+        return 0L;
+
+    *min_x = lo_x; *min_y = lo_y; *min_z = lo_z;
+    *max_x = hi_x; *max_y = hi_y; *max_z = hi_z;
     return 1L;
 }

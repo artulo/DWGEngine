@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdio.h>
 
 #include "dwg_transform.h"
 #include "dwg_geometry.h"
@@ -12,6 +13,7 @@
 #include "dwg_insert.h"
 #include "dwg_block.h"
 #include "dwg_document.h"
+#include "dwg_dimension.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -123,10 +125,7 @@ void dwg_entity_move(HENTITY hEntity, double dx, double dy, double dz)
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(hEntity);
-        HVERTEX v;
-        if (pl == NULL)
-            break;
-        v = dwg_polyline_first_vertex(pl);
+        HVERTEX v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -169,6 +168,17 @@ void dwg_entity_move(HENTITY hEntity, double dx, double dy, double dz)
         move_point(&s->p2, dx, dy, dz);
         move_point(&s->p3, dx, dy, dz);
         move_point(&s->p4, dx, dy, dz);
+        break;
+    }
+    case DWG_ENTITY_DIMENSION:
+    {
+        /* sin angulo aparte que sincronizar -- ver el comentario de
+           dwg_dimension.h, dim_rotation siempre se recalcula de
+           xline1/xline2 donde haga falta */
+        DWG_DIMENSION3D *dm = (DWG_DIMENSION3D *)hEntity->geometry;
+        move_point(&dm->xline1, dx, dy, dz);
+        move_point(&dm->xline2, dx, dy, dz);
+        move_point(&dm->def_pt, dx, dy, dz);
         break;
     }
     default:
@@ -254,10 +264,7 @@ void dwg_entity_rotate(HENTITY hEntity,
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(hEntity);
-        HVERTEX v;
-        if (pl == NULL)
-            break;
-        v = dwg_polyline_first_vertex(pl);
+        HVERTEX v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -308,6 +315,14 @@ void dwg_entity_rotate(HENTITY hEntity,
         rotate_point(&s->p2, cx, cy, rad);
         rotate_point(&s->p3, cx, cy, rad);
         rotate_point(&s->p4, cx, cy, rad);
+        break;
+    }
+    case DWG_ENTITY_DIMENSION:
+    {
+        DWG_DIMENSION3D *dm = (DWG_DIMENSION3D *)hEntity->geometry;
+        rotate_point(&dm->xline1, cx, cy, rad);
+        rotate_point(&dm->xline2, cx, cy, rad);
+        rotate_point(&dm->def_pt, cx, cy, rad);
         break;
     }
     default:
@@ -401,10 +416,7 @@ static void entity_scale_xyz(HENTITY hEntity,
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(hEntity);
-        HVERTEX v;
-        if (pl == NULL)
-            break;
-        v = dwg_polyline_first_vertex(pl);
+        HVERTEX v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -455,6 +467,14 @@ static void entity_scale_xyz(HENTITY hEntity,
         scale_point_xyz(&s->p2, cx, cy, cz, sx, sy, sz);
         scale_point_xyz(&s->p3, cx, cy, cz, sx, sy, sz);
         scale_point_xyz(&s->p4, cx, cy, cz, sx, sy, sz);
+        break;
+    }
+    case DWG_ENTITY_DIMENSION:
+    {
+        DWG_DIMENSION3D *dm = (DWG_DIMENSION3D *)hEntity->geometry;
+        scale_point_xyz(&dm->xline1, cx, cy, cz, sx, sy, sz);
+        scale_point_xyz(&dm->xline2, cx, cy, cz, sx, sy, sz);
+        scale_point_xyz(&dm->def_pt, cx, cy, cz, sx, sy, sz);
         break;
     }
     default:
@@ -557,10 +577,7 @@ void dwg_entity_mirror(HENTITY hEntity,
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(hEntity);
-        HVERTEX v;
-        if (pl == NULL)
-            break;
-        v = dwg_polyline_first_vertex(pl);
+        HVERTEX v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -611,6 +628,18 @@ void dwg_entity_mirror(HENTITY hEntity,
         mirror_point(&s->p2, x1, y1, x2, y2);
         mirror_point(&s->p3, x1, y1, x2, y2);
         mirror_point(&s->p4, x1, y1, x2, y2);
+        break;
+    }
+    case DWG_ENTITY_DIMENSION:
+    {
+        /* espejar los 3 puntos alcanza -- dim_rotation se recalcula
+           solo de xline1/xline2, sin el caso especial que un angulo de
+           ARC si necesita (angulos invertidos+intercambiados, ver
+           dwg_transform.h) */
+        DWG_DIMENSION3D *dm = (DWG_DIMENSION3D *)hEntity->geometry;
+        mirror_point(&dm->xline1, x1, y1, x2, y2);
+        mirror_point(&dm->xline2, x1, y1, x2, y2);
+        mirror_point(&dm->def_pt, x1, y1, x2, y2);
         break;
     }
     default:
@@ -728,6 +757,14 @@ HENTITY dwg_entity_copy(HDWG hDwg, HENTITY hEntity)
                            f->p3.x, f->p3.y, f->p3.z, f->p4.x, f->p4.y, f->p4.z);
         if (dst != NULL)
             dwg_face_set_edge_flags(dst, f->edge_flags);
+        break;
+    }
+    case DWG_ENTITY_DIMENSION:
+    {
+        DWG_DIMENSION3D *dm = (DWG_DIMENSION3D *)hEntity->geometry;
+        dst = dwg_add_dimension_linear(hDwg, dm->xline1.x, dm->xline1.y, dm->xline1.z,
+                                       dm->xline2.x, dm->xline2.y, dm->xline2.z,
+                                       dm->def_pt.x, dm->def_pt.y, dm->def_pt.z);
         break;
     }
     case DWG_ENTITY_POLYLINE:
@@ -1006,10 +1043,7 @@ static void apply_insert_transform(HENTITY e, double sx, double sy, double sz,
     case DWG_ENTITY_POLYLINE:
     {
         HPOLYLINE pl = dwg_polyline_from_entity(e);
-        HVERTEX v;
-        if (pl == NULL)
-            break;
-        v = dwg_polyline_first_vertex(pl);
+        HVERTEX v = dwg_polyline_first_vertex(pl);
         while (v != NULL)
         {
             double x, y, z;
@@ -1062,6 +1096,14 @@ static void apply_insert_transform(HENTITY e, double sx, double sy, double sz,
         insert_transform_point(&s->p4, sx, sy, sz, rad, ix, iy, iz);
         break;
     }
+    case DWG_ENTITY_DIMENSION:
+    {
+        DWG_DIMENSION3D *dm = (DWG_DIMENSION3D *)e->geometry;
+        insert_transform_point(&dm->xline1, sx, sy, sz, rad, ix, iy, iz);
+        insert_transform_point(&dm->xline2, sx, sy, sz, rad, ix, iy, iz);
+        insert_transform_point(&dm->def_pt, sx, sy, sz, rad, ix, iy, iz);
+        break;
+    }
     default:
         break;
     }
@@ -1094,6 +1136,52 @@ static unsigned long explode_insert(HDWG hDwg, HENTITY hEntity)
     return created;
 }
 
+/* Genera las 3 LINE reales (mismo calculo de proyeccion perpendicular
+   que dwg_render.c's draw_dimension y bridge_dimension en
+   dwg_libredwg_bridge.c) + 1 TEXT con el valor medido -- mismo patron
+   "agrega entidades nuevas a hDwg, no borra la original" que
+   explode_polyline/explode_insert ya usan. */
+static unsigned long explode_dimension(HDWG hDwg, HENTITY hEntity)
+{
+    DWG_DIMENSION3D *g = (DWG_DIMENSION3D *)hEntity->geometry;
+    double dx, dy, dist, dirx, diry, perpx, perpy;
+    double def_perp, xl1_perp, xl2_perp, delta1, delta2;
+    double dl1x, dl1y, dl2x, dl2y, midx, midy, angle_deg;
+    char text[32];
+    HENTITY e;
+    unsigned long count = 0UL;
+
+    dx = g->xline2.x - g->xline1.x;
+    dy = g->xline2.y - g->xline1.y;
+    dist = sqrt(dx * dx + dy * dy);
+    if (dist < 1.0e-9) { dirx = 1.0; diry = 0.0; } else { dirx = dx / dist; diry = dy / dist; }
+    perpx = -diry; perpy = dirx;
+
+    def_perp = g->def_pt.x * perpx + g->def_pt.y * perpy;
+    xl1_perp = g->xline1.x * perpx + g->xline1.y * perpy;
+    xl2_perp = g->xline2.x * perpx + g->xline2.y * perpy;
+    delta1 = def_perp - xl1_perp;
+    delta2 = def_perp - xl2_perp;
+    dl1x = g->xline1.x + delta1 * perpx; dl1y = g->xline1.y + delta1 * perpy;
+    dl2x = g->xline2.x + delta2 * perpx; dl2y = g->xline2.y + delta2 * perpy;
+
+    e = dwg_add_line(hDwg, g->xline1.x, g->xline1.y, g->xline1.z, dl1x, dl1y, g->xline1.z);
+    if (e != NULL) count++;
+    e = dwg_add_line(hDwg, g->xline2.x, g->xline2.y, g->xline2.z, dl2x, dl2y, g->xline2.z);
+    if (e != NULL) count++;
+    e = dwg_add_line(hDwg, dl1x, dl1y, g->xline1.z, dl2x, dl2y, g->xline2.z);
+    if (e != NULL) count++;
+
+    midx = (dl1x + dl2x) / 2.0;
+    midy = (dl1y + dl2y) / 2.0;
+    angle_deg = atan2(diry, dirx) * 180.0 / M_PI;
+    sprintf(text, "%.2f", dist);
+    e = dwg_add_text(hDwg, midx, midy, g->xline1.z, 2.5, angle_deg, text);
+    if (e != NULL) count++;
+
+    return count;
+}
+
 unsigned long dwg_entity_explode(HDWG hDwg, HENTITY hEntity)
 {
     if (hDwg == NULL || hEntity == NULL || hEntity->geometry == NULL)
@@ -1106,6 +1194,9 @@ unsigned long dwg_entity_explode(HDWG hDwg, HENTITY hEntity)
 
     case DWG_ENTITY_INSERT:
         return explode_insert(hDwg, hEntity);
+
+    case DWG_ENTITY_DIMENSION:
+        return explode_dimension(hDwg, hEntity);
 
     default:
         return 0UL;

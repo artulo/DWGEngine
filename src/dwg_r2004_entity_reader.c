@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include "dwg_r2004_reader.h"
 #include "dwg_r2004_decompress.h"
 #include "dwg_bitstream.h"
@@ -11,7 +12,6 @@
 #include "dwg_solid.h"
 #include "dwg_insert.h"
 #include "dwg_hatch.h"
-#include "dwg_leader.h"
 #include "dwg_vertex.h"
 #include "dwg_transform.h"
 #include "dwg_text.h"
@@ -27,7 +27,6 @@
 
 #define DWG_R2004_MAX_PLAUSIBLE_COORD 1.0e7
 #define DWG_R2004_MAX_REACTORS 1000UL
-#define DWG_R2004_MAX_LEADER_VERTICES 100000UL
 #define DWG_R2004_MAX_SECTIONS 64UL
 #define DWG_R2004_MAX_PAGES 8192UL
 #define DWG_R2004_MAX_PAGES_PER_SECTION 4096UL
@@ -57,7 +56,44 @@ static long rld_at(const unsigned char *data, unsigned long off)
     return (long)rl_at(data, off);
 }
 
-/* read_whole_file removed -- use dwg_read_whole_file from dwg_file_io.c */
+static unsigned char *read_whole_file(const char *path, unsigned long *out_length)
+{
+    FILE *fp;
+    long size;
+    unsigned char *buf;
+
+    fp = fopen(path, "rb");
+    if (fp == NULL)
+        return NULL;
+
+    fseek(fp, 0, SEEK_END);
+    size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (size < 0)
+    {
+        fclose(fp);
+        return NULL;
+    }
+
+    buf = (unsigned char *)malloc((size_t)size);
+    if (buf == NULL)
+    {
+        fclose(fp);
+        return NULL;
+    }
+
+    if (fread(buf, 1, (size_t)size, fp) != (size_t)size)
+    {
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+
+    fclose(fp);
+    *out_length = (unsigned long)size;
+    return buf;
+}
 
 /* ---- encrypted file header (0x80..0x80+0x6C), spec 4.3/r2004_file_header.spec ---- */
 
@@ -175,6 +211,16 @@ typedef struct
 {
     char name[65];
     unsigned long total_size; /* declared decompressed size of the whole section */
+    unsigned long compressed; /* 1=no, 2=yes -- per LibreDWG's real src/decode.c
+                                  (read_2004_compressed_section): sections marked
+                                  1 store each page's bytes RAW after its 32-byte
+                                  header, no LZ77 involved at all -- running the
+                                  decompressor on them anyway (this reader's own
+                                  gap until this fix) produces plausible-looking
+                                  garbage instead of an error, since LZ77-
+                                  interpreted arbitrary bytes can easily still
+                                  reach a byte close to the expected decompressed
+                                  size by chance. */
     DWG_R2004_SECPAGE pages[DWG_R2004_MAX_PAGES_PER_SECTION];
     unsigned long page_count;
 } DWG_R2004_SECTION;
@@ -231,10 +277,50 @@ static unsigned char *decompress_section(const unsigned char *data, unsigned lon
         if (start_off + decomp_size > sec->total_size + 4096UL)
             continue;
 
-        produced = dwg_r2004_decompress(data + file_addr + 32UL, comp_size,
-                                        out + start_off, (sec->total_size + 4096UL) - start_off,
-                                        decomp_size);
-        (void)produced;
+        /* Real, confirmed bug found via LibreDWG's actual source
+           (D:\estudio\libredwg-master/src/decode.c,
+           read_2004_compressed_section): whether a page is even LZ77-
+           compressed at all is a per-SECTION flag (`compressed`, 1=no,
+           2=yes) read from the file itself -- this reader used to run
+           the decompressor UNCONDITIONALLY on every page regardless of
+           this flag. For a section actually marked uncompressed (1),
+           its pages store raw bytes directly after the 32-byte page
+           header -- running the LZ77 decompressor on them anyway
+           doesn't error out (arbitrary bytes still parse as SOME
+           sequence of opcodes and can coincidentally reach a length
+           close to the expected decompressed size), it just silently
+           produces GARBAGE that structurally happens to look like
+           noise rather than real objects -- a much harder class of bug
+           to detect than a missing page or a short decompression (both
+           already checked and ruled out earlier this investigation).
+           This is the leading suspect for the still-unexplained
+           PUERTAS/VENTANAS/LOSAS content gap on `02_Planta 1 Baja_
+           A3ver18.dwg`. */
+        if (sec->compressed == 2UL)
+        {
+            produced = dwg_r2004_decompress(data + file_addr + 32UL, comp_size,
+                                            out + start_off, (sec->total_size + 4096UL) - start_off,
+                                            decomp_size);
+            (void)produced;
+        }
+        else
+        {
+            /* uncompressed page: raw passthrough, mirroring LibreDWG's
+               own real uncompressed-section path exactly (size = MIN
+               (section_total_size - start_offset, page_size), copied
+               straight from right after the page header). */
+            unsigned long copy_size = decomp_size;
+            if (start_off < sec->total_size)
+            {
+                unsigned long avail = sec->total_size - start_off;
+                if (copy_size > avail) copy_size = avail;
+            }
+            else
+                copy_size = 0UL;
+            if (copy_size > 0UL && file_addr + 32UL + copy_size <= length &&
+                start_off + copy_size <= sec->total_size + 4096UL)
+                memcpy(out + start_off, data + file_addr + 32UL, (size_t)copy_size);
+        }
     }
 
     return out;
@@ -321,9 +407,11 @@ static int parse_section_info(const unsigned char *data, unsigned long length,
         sec_size_lo = rl_at(decomp, off); /* low 32 bits of an RLL total-size field */
         off += 8UL; /* skip the high 32 bits, real files never exceed 4GB per section */
         num_sections = rl_at(decomp, off);
-        off += 6UL * 4UL; /* num_sections, max_decomp_size, unknown, compressed, type, encrypted */
 
         s = &sections[count];
+        s->compressed = rl_at(decomp, off + 12UL); /* 3rd RL after num_sections: max_decomp_size, unknown, THEN compressed -- confirmed field order against LibreDWG's real read_R2004_section_info (src/decode.c) */
+        off += 6UL * 4UL; /* num_sections, max_decomp_size, unknown, compressed, type, encrypted */
+
         memset(s->name, 0, sizeof(s->name));
         memcpy(s->name, decomp + off, 64UL);
         s->name[64] = '\0';
@@ -644,13 +732,109 @@ static unsigned long dwg_bs_read_bll_lowpart(DWG_BITSTREAM *bs)
    `Nolinks` (only exists in the bitstream through R2002 -- R2004+ never
    reads it at all). Caller has already read Length(MS)+handlestream_size
    (UMC)+Type before calling this. */
+/* R2004+'s per-ENTITY color encoding ("ENC" in LibreDWG's own naming,
+   see common_entity_data.spec's `SINCE (R_2004a) // ENC (entity color
+   encoding)` block, confirmed against the real source at
+   D:\estudio\libredwg-master): a single BS with flag bits packed into
+   its OWN high byte (0x20=has alpha, 0x40=color-handle/book, 0x80=RGB,
+   plus 0x01/0x02 sub-flags gating an extra name string for each),
+   followed by whatever those flags require -- NOT the same encoding
+   LAYER's own color field uses (see read_r2004_table_color's own
+   comment for that real, byte-verified difference -- confirmed the
+   hard way: reusing THIS function for LAYER produced a plausible-
+   looking but systematically wrong color on every single layer).
+   Extracted from read_common_entity_r2004's own inline block (logic
+   unchanged) purely so it has its own name distinguishing it from the
+   table-object version below -- entities are the only real caller. */
+static unsigned short read_r2004_cmc_color(DWG_BITSTREAM *bs)
+{
+    unsigned char code;
+    unsigned long value;
+    unsigned long color_raw, color_flag;
+
+    color_raw = dwg_bs_read_bs(bs); /* ENC: BS with flags in the high byte */
+    color_flag = color_raw >> 8;
+    if (color_flag & 0x20UL)
+        (void)dwg_bs_read_bl(bs); /* alpha */
+    if (color_flag & 0x40UL)
+        dwg_bs_read_handle(bs, &code, &value); /* color book/handle color -- not modeled */
+    else if (color_flag & 0x80UL)
+        (void)dwg_bs_read_bl(bs); /* RGB value -- not modeled */
+    if ((color_flag & 0x41UL) == 0x41UL)
+    {
+        char tmp[256];
+        (void)dwg_bs_read_t(bs, tmp, sizeof(tmp)); /* color name */
+    }
+    if ((color_flag & 0x42UL) == 0x42UL)
+    {
+        char tmp[256];
+        (void)dwg_bs_read_t(bs, tmp, sizeof(tmp)); /* color book name */
+    }
+    /* the low byte is only a real ACI index when neither the color-
+       handle (0x40) nor RGB (0x80) flag is set -- see read_common_
+       entity_r2004's own comment (unchanged) for the real ROTATORIO.dwg
+       case this guards against. */
+    return (color_flag & 0xC0UL) ? 0U : (unsigned short)(color_raw & 0xFFUL);
+}
+
+/* Real, confirmed different encoding found via LibreDWG's actual
+   source (D:\estudio\libredwg-master/src/bits.c, `bit_read_CMC`, the
+   function `FIELD_CMC` -- used by LAYER/STYLE/LTYPE/etc's table-record
+   spec, dwg.spec's `DWG_TABLE(LAYER)` -- actually calls, confirmed
+   distinct from entities' own lowercase `field_cmc`/ENC function
+   above): `index = BS` (the palette index -- for our purposes the
+   only part worth keeping, see below), then UNCONDITIONALLY (every
+   version since R_2004, no flag gates it) `rgb = BL` (a full 32-bit
+   raw long, NOT a flag-and-payload BS) and `flag = RC` (one raw byte,
+   bit0/bit1 gating a name/book_name string pair) -- both always
+   physically present regardless of `flag`'s value. Critically, the
+   real name/book_name strings (when `flag` indicates they exist) are
+   read from the file's separate STRING stream, not this main one --
+   so they cost zero bits here regardless, nothing to skip. The first
+   `index` reads gets overwritten by a computed nearest-palette-match
+   from `rgb` in LibreDWG's own real implementation (true-color mode);
+   this reader doesn't replicate that palette lookup (same "simple ACI
+   only, RGB/named colors not modeled" simplification already used for
+   entity color) -- the raw `index` is used directly, correct for the
+   common case (a plain ACI-indexed layer, not a custom true-color
+   one), same tradeoff already accepted elsewhere in this file. */
+static unsigned short read_r2004_table_color(DWG_BITSTREAM *bs)
+{
+    unsigned long index_raw, rgb_raw, flag_raw;
+
+    index_raw = dwg_bs_read_bs(bs);
+    rgb_raw = dwg_bs_read_bl(bs);   /* unconditional for R2004+, always present */
+    flag_raw = dwg_bs_read_rc(bs);  /* unconditional for R2004+, always present */
+    (void)flag_raw;
+
+    /* Real, confirmed via direct inspection (a dedicated raw-value dump
+       against this exact file): `index_raw` alone is 0/BYBLOCK for
+       EVERY real layer here -- this file was saved with its layer
+       colors in TrueColor form, not the plain legacy index field.
+       `rgb_raw`'s top byte (method, per bit_read_CMC/bit_upconvert_CMC)
+       is 0xC3 ("TrueColor") for every one of them, and the LOW byte is
+       a small, plausible standard ACI value (1-8 range observed: red/
+       yellow/green/cyan/blue/magenta/white/gray) -- LibreDWG's own
+       bit_upconvert_CMC confirms this exact convention: method 0xc3
+       packs a palette INDEX into rgb's low bits, not a literal 24-bit
+       RGB triple. Not implementing the general nearest-palette-match
+       LibreDWG's real decoder does for genuine arbitrary RGB colors
+       (out of scope, same "simple ACI only" simplification already
+       used for entity color) -- but this specific, common "ACI stored
+       via TrueColor method" case is real, verified data worth using
+       directly rather than falling through to the useless index_raw=0. */
+    if ((rgb_raw >> 24) == 0xC3UL && (rgb_raw & 0x00FFFFFFUL) <= 255UL)
+        return (unsigned short)(rgb_raw & 0xFFUL);
+
+    return (unsigned short)(index_raw & 0xFFFFUL);
+}
+
 static long read_common_entity_r2004(DWG_BITSTREAM *bs, DWG_R2004_COMMON_ENTITY *out)
 {
     unsigned char code;
     unsigned long value;
     unsigned long eed_size;
     unsigned long numreactors;
-    unsigned long color_raw, color_flag;
 
     dwg_bs_read_handle(bs, &code, &value);
     out->handle = value; /* code is 0 (absolute) for an object's own handle */
@@ -709,33 +893,12 @@ static long read_common_entity_r2004(DWG_BITSTREAM *bs, DWG_R2004_COMMON_ENTITY 
     /* Nolinks does NOT exist in the bitstream for R2004+ -- deliberately
        not read here, see the function comment. */
 
-    color_raw = dwg_bs_read_bs(bs); /* ENC: BS with flags in the high byte */
-    color_flag = color_raw >> 8;
-    if (color_flag & 0x20UL)
-        (void)dwg_bs_read_bl(bs); /* alpha */
-    if (color_flag & 0x40UL)
-        dwg_bs_read_handle(bs, &code, &value); /* color book/handle color -- not modeled */
-    else if (color_flag & 0x80UL)
-        (void)dwg_bs_read_bl(bs); /* RGB value -- not modeled */
-    if ((color_flag & 0x41UL) == 0x41UL)
-    {
-        char tmp[256];
-        (void)dwg_bs_read_t(bs, tmp, sizeof(tmp)); /* color name */
-    }
-    if ((color_flag & 0x42UL) == 0x42UL)
-    {
-        char tmp[256];
-        (void)dwg_bs_read_t(bs, tmp, sizeof(tmp)); /* book name */
-    }
-    /* the low byte is only a real ACI index when neither the color-
-       handle (0x40) nor RGB (0x80) flag is set -- otherwise it's a
-       true-color marker byte, not an index, and would produce a
-       nonsense color (confirmed against real data: 2 real entities in
-       ROTATORIO.dwg decoded color=8192/0x2000 -- the alpha flag (0x20)
-       plus a zero index -- before this fix). RGB/named colors
-       themselves are read above (to stay correctly positioned) but not
-       modeled, same simplification as R13/14's un-resolved STYLE name. */
-    out->color = (color_flag & 0xC0UL) ? 0U : (unsigned short)(color_raw & 0xFFUL);
+    /* confirmed against real data: 2 real entities in ROTATORIO.dwg
+       decoded color=8192/0x2000 (the alpha flag (0x20) plus a zero
+       index) before this parsing existed -- see read_r2004_cmc_color's
+       own comment for why the low byte alone isn't always a real ACI
+       index. */
+    out->color = read_r2004_cmc_color(bs);
 
     (void)dwg_bs_read_bd(bs); /* ltype scale */
     (void)dwg_bs_read_bb(bs); /* ltype flags */
@@ -768,7 +931,8 @@ static long resolve_r2004_layer_name(const unsigned char *data, unsigned long le
                                      const DWG_R2004_HANDLE_ENTRY *handles, unsigned long handle_count,
                                      unsigned long type_start_bit, unsigned long bitsize,
                                      const DWG_R2004_COMMON_ENTITY *common,
-                                     char *out_name, unsigned long out_size)
+                                     char *out_name, unsigned long out_size,
+                                     unsigned short *out_color)
 {
     DWG_BITSTREAM bs;
     unsigned char code;
@@ -818,64 +982,80 @@ static long resolve_r2004_layer_name(const unsigned char *data, unsigned long le
         return 0L;
 
     layer_bitsize = layer_length * 8UL - layer_hdlstream_size;
+
+    /* Real gap, twice attempted-and-reverted earlier this session for
+       lack of a verified field reference (see the two UPDATE blocks
+       above `carve_missing_handles` for that full history) -- fixed
+       now against LibreDWG's actual source (`D:\estudio\libredwg-master`,
+       Arturo pointed at it directly), not a web-fetched fragment.
+       Confirmed byte-for-byte from `src/decode.c`'s `dwg_decode_object`
+       (the shared prologue every non-entity object goes through) and
+       `src/common_object_handle_data.spec`: after the object's own
+       Type field, the MAIN-STREAM sequence is handle(H) -> EED loop ->
+       num_reactors(BL) -> is_xdic_missing(B, SINCE R_2004a) ->
+       has_ds_data(B, SINCE R_2013) -- EXACTLY the same shape
+       read_common_entity_r2004 already uses for entities (objects just
+       skip entities' own preview/entmode fields), confirming that part
+       was already right. ownerhandle/reactors/xdicobjhandle are ALL
+       read via FIELD_HANDLE, which `src/dec_macros.h`'s VALUE_H macro
+       confirms reads from `hdl_dat` (the separate handle-stream) for
+       every version since R_13b1, NOT the main stream -- zero main-
+       stream bits, so nothing to skip for them here.
+
+       Then LAYER's own fields, confirmed from `src/dwg.spec`'s
+       `DWG_TABLE(LAYER)` + spec.h's `COMMON_TABLE_FLAGS` macro: Entry
+       Name is hoisted entirely to the separate string-stream for
+       R2007+ (zero main-stream bits, already handled by this
+       function's own string-stream read below) -- COMMON_TABLE_FLAGS's
+       own LATER_VERSIONS branch inside UNTIL(R_2004)'s sibling
+       (i.e. our R2004a+ target) reads is_xref_ref/is_xref_dep as
+       DERIVED values, not separate bitstream reads; the only real
+       field it consumes is is_xref_resolved(BS) -- ONE field, not the
+       three-field (bit+BS+bit) trio the FIRST reverted attempt
+       assumed, which is the exact bug that produced a fixed,
+       content-independent misalignment (same wrong color every
+       layer). The xref HANDLE itself is deferred to the handle-stream
+       (same FIELD_HANDLE rule as above). After that: flag0(BS, SINCE
+       R_2000b -- frozen/off/frozen_in_new/locked/plotflag/linewt
+       combined) then color via `FIELD_CMC` -- confirmed to directly
+       follow flag0 with nothing in between, but a GENUINELY DIFFERENT
+       encoding from entity color (see read_r2004_table_color's own
+       comment for the real, byte-verified difference -- confirmed the
+       hard way: reusing read_r2004_cmc_color here first produced a
+       plausible-looking but systematically wrong color on every single
+       real layer in this file, root-caused by checking the actual
+       LibreDWG source rather than guessing further). */
+    if (out_color != NULL)
+    {
+        unsigned long eed_size2, numreactors2;
+
+        *out_color = 0U; /* default: caller's own BYLAYER/BYBLOCK fallback if anything below bails early */
+
+        dwg_bs_read_handle(&bs, &code, &value); /* the LAYER object's own handle -- discarded, already known */
+
+        eed_size2 = dwg_bs_read_bs(&bs);
+        while (eed_size2 != 0UL)
+        {
+            unsigned long k2;
+            dwg_bs_read_handle(&bs, &code, &value); /* EED application handle */
+            for (k2 = 0UL; k2 < eed_size2; k2++)
+                (void)dwg_bs_read_rc(&bs);
+            eed_size2 = dwg_bs_read_bs(&bs);
+        }
+
+        numreactors2 = dwg_bs_read_bl(&bs);
+        if (numreactors2 <= 1000UL) /* implausible -- same defensive bound used elsewhere; bail rather than misread color */
+        {
+            (void)dwg_bs_read_bit(&bs); /* is_xdic_missing, SINCE R_2004a */
+            (void)dwg_bs_read_bit(&bs); /* has_ds_data, SINCE R_2013 -- our AC1024/1027/1032 targets are all >= R_2013 */
+            (void)dwg_bs_read_bs(&bs);  /* is_xref_resolved -- COMMON_TABLE_FLAGS's only real main-stream field for R2004a+ */
+            (void)dwg_bs_read_bs(&bs);  /* flag0: frozen/off/frozen_in_new/locked/plotflag/linewt, combined BS -- SINCE R_2000b */
+
+            *out_color = read_r2004_table_color(&bs);
+        }
+    }
+
     return read_r2004_first_string(data, length, layer_type_start, layer_bitsize, out_name, out_size);
-}
-
-/* Like resolve_r2004_layer_name but resolves the STYLE handle that
-   follows the LAYER handle in TEXT/MTEXT entity handle streams.
-   Handle order in the entity handle stream:
-     ownerhandle (if entmode==0), reactors, xdicobjhandle (if present),
-     LAYER, STYLE (for TEXT/MTEXT). */
-static long resolve_r2004_style_name(const unsigned char *data, unsigned long length,
-                                     const DWG_R2004_HANDLE_ENTRY *handles, unsigned long handle_count,
-                                     unsigned long type_start_bit, unsigned long bitsize,
-                                     const DWG_R2004_COMMON_ENTITY *common,
-                                     char *out_name, unsigned long out_size)
-{
-    DWG_BITSTREAM bs;
-    unsigned char code;
-    unsigned long value, k, layer_handle, style_handle, style_offset, style_type_start;
-    unsigned long style_length, style_hdlstream_size, style_bitsize, style_obj_type;
-
-    if (type_start_bit + bitsize > length * 8UL)
-        return 0L;
-
-    dwg_bs_init(&bs, data, length);
-    dwg_bs_seek_bit(&bs, type_start_bit + bitsize);
-
-    /* Skip ownerhandle, reactors, xdicobjhandle -- same as layer resolver */
-    if (common->entmode == 0UL)
-        dwg_bs_read_handle(&bs, &code, &value); /* ownerhandle */
-    for (k = 0UL; k < common->numreactors; k++)
-        dwg_bs_read_handle(&bs, &code, &value);
-    if (common->xdic_missing == 0UL)
-        dwg_bs_read_handle(&bs, &code, &value); /* xdicobjhandle */
-
-    /* Skip LAYER handle */
-    dwg_bs_read_handle(&bs, &code, &value);
-
-    /* Read STYLE handle (the one after LAYER for TEXT/MTEXT) */
-    dwg_bs_read_handle(&bs, &code, &value);
-    style_handle = dwg_bs_resolve_handle(code, value, common->handle);
-
-    if (!find_handle(handles, handle_count, style_handle, &style_offset))
-        return 0L;
-    if (style_offset + 8UL >= length)
-        return 0L;
-
-    dwg_bs_seek_bit(&bs, style_offset * 8UL);
-    style_length = dwg_bs_read_ms(&bs);
-    if (style_length == 0UL)
-        return 0L;
-
-    style_hdlstream_size = dwg_bs_read_mc(&bs, 0);
-    style_type_start = dwg_bs_tell_bit(&bs);
-    style_obj_type = read_object_type_r2010(&bs);
-    if (style_obj_type != 0x35UL) /* not really a STYLE -- skip */
-        return 0L;
-
-    style_bitsize = style_length * 8UL - style_hdlstream_size;
-    return read_r2004_first_string(data, length, style_type_start, style_bitsize, out_name, out_size);
 }
 
 /* ---- geometry decoders: same field shape as R2000 (R2004+/R2010+ only
@@ -888,8 +1068,6 @@ static long resolve_r2004_style_name(const unsigned char *data, unsigned long le
 #define DWG_R2004_TYPE_LINE   0x13UL
 #define DWG_R2004_TYPE_POINT  0x1BUL
 #define DWG_R2004_TYPE_SOLID  0x1FUL
-#define DWG_R2004_TYPE_ELLIPSE  0x46UL
-#define DWG_R2004_TYPE_LEADER   0x30UL
 
 static HENTITY decode_line(HDWG hDwg, DWG_BITSTREAM *bs)
 {
@@ -943,6 +1121,16 @@ static HENTITY decode_circle(HDWG hDwg, DWG_BITSTREAM *bs)
         !is_plausible_coord(radius))
         return NULL;
 
+    /* NOT applying the R2000/R14 readers' "reject exact origin" check
+       here (see dwg_r2000_entity_reader.c's decode_circle for that
+       reasoning) -- confirmed via regression test that it costs 2 real
+       entities on ROTATORIO2.dwg (592 -> 590), a traffic-roundabout
+       drawing where a circle/arc genuinely centered at the drawing's
+       own local origin is a completely plausible, common design
+       choice, unlike the BIM floor plans the origin-artifact bug was
+       found on. R2004 also never used this session's resync/salvage
+       machinery, the actual source of the original bug -- no evidence
+       this file needs the extra check at all. */
     return dwg_add_circle(hDwg, center.x, center.y, center.z, radius);
 }
 
@@ -961,85 +1149,20 @@ static HENTITY decode_arc(HDWG hDwg, DWG_BITSTREAM *bs)
     start_angle_rad = dwg_bs_read_bd(bs);
     end_angle_rad = dwg_bs_read_bd(bs);
 
+    /* Same real hang fixed in the R2000/R14 readers' own copy of this
+       check -- angles were never validated, and an unvalidated garbage
+       angle can make draw_arc's sweep normalization loop effectively
+       forever, or feed an undefined-behavior segment-count cast if it
+       escapes (dwg_render.c). */
     if (!is_plausible_coord(center.x) || !is_plausible_coord(center.y) || !is_plausible_coord(center.z) ||
-        !is_plausible_coord(radius))
+        !is_plausible_coord(radius) || !is_plausible_coord(start_angle_rad) || !is_plausible_coord(end_angle_rad))
         return NULL;
 
+    /* Deliberately NOT applying the "reject exact origin" check here
+       -- see decode_circle's own comment just above for why (confirmed
+       regression on ROTATORIO2.dwg). */
     return dwg_add_arc(hDwg, center.x, center.y, center.z, radius,
                        start_angle_rad * 180.0 / M_PI, end_angle_rad * 180.0 / M_PI);
-}
-
-static HENTITY decode_ellipse(HDWG hDwg, DWG_BITSTREAM *bs)
-{
-    DWG_POINT3D center, major_axis;
-    double axis_ratio, start_param, end_param;
-
-    dwg_bs_read_3bd(bs, &center);
-    dwg_bs_read_3bd(bs, &major_axis);
-    axis_ratio = dwg_bs_read_bd(bs);
-    start_param = dwg_bs_read_bd(bs);
-    end_param = dwg_bs_read_bd(bs);
-
-    if (!is_plausible_coord(center.x) || !is_plausible_coord(center.y) || !is_plausible_coord(center.z) ||
-        !is_plausible_coord(major_axis.x) || !is_plausible_coord(major_axis.y) || !is_plausible_coord(major_axis.z))
-        return NULL;
-
-    return dwg_add_ellipse(hDwg, center.x, center.y, center.z,
-                           major_axis.x, major_axis.y, major_axis.z,
-                           axis_ratio, start_param, end_param);
-}
-
-static HENTITY decode_leader(HDWG hDwg, DWG_BITSTREAM *bs)
-{
-    unsigned char class_version;
-    double arrow_size;
-    unsigned short path_type, creation_type;
-    unsigned char annot_handle_code;
-    unsigned long annot_handle_value;
-    unsigned long num_vertex, i;
-    HENTITY e;
-
-    class_version = dwg_bs_read_rc(bs);
-    arrow_size = dwg_bs_read_bd(bs);
-    path_type = dwg_bs_read_bs(bs);
-    creation_type = dwg_bs_read_bs(bs);
-    (void)path_type; (void)creation_type;
-
-    dwg_bs_read_handle(bs, &annot_handle_code, &annot_handle_value);
-
-    num_vertex = dwg_bs_read_bl(bs);
-    if (num_vertex > DWG_R2004_MAX_LEADER_VERTICES)
-        num_vertex = DWG_R2004_MAX_LEADER_VERTICES;
-
-    e = dwg_add_leader(hDwg);
-    if (e == NULL)
-        return NULL;
-
-    dwg_leader_set_arrow_size(e, arrow_size);
-
-    for (i = 0UL; i < num_vertex; i++)
-    {
-        DWG_POINT3D pt;
-        dwg_bs_read_3bd(bs, &pt);
-        if (!is_plausible_coord(pt.x) || !is_plausible_coord(pt.y) || !is_plausible_coord(pt.z))
-        {
-            dwg_entity_destroy(e);
-            return NULL;
-        }
-        dwg_leader_add_vertex(e, pt.x, pt.y, pt.z);
-    }
-
-    {
-        DWG_POINT3D extrusion;
-        dwg_bs_read_be(bs, &extrusion);
-    }
-    {
-        DWG_POINT3D xto_dir;
-        dwg_bs_read_3bd(bs, &xto_dir);
-    }
-    (void)dwg_bs_read_bs(bs);
-
-    return e;
 }
 
 static HENTITY decode_point(HDWG hDwg, DWG_BITSTREAM *bs)
@@ -1515,8 +1638,7 @@ static void decode_and_transform_block_entity_r2004(HDWG hDwg, const unsigned ch
     if (obj_type != DWG_R2004_TYPE_LINE && obj_type != DWG_R2004_TYPE_CIRCLE &&
         obj_type != DWG_R2004_TYPE_ARC && obj_type != DWG_R2004_TYPE_POINT &&
         obj_type != DWG_R2004_TYPE_SOLID && obj_type != DWG_R2004_TYPE_TEXT &&
-        obj_type != DWG_R2004_TYPE_MTEXT && obj_type != DWG_R2004_TYPE_ELLIPSE &&
-        obj_type != DWG_R2004_TYPE_LEADER && obj_type != DWG_R2004_TYPE_LWPOLYLINE)
+        obj_type != DWG_R2004_TYPE_MTEXT)
         return;
 
     if (!read_common_entity_r2004(&bs, &common))
@@ -1527,13 +1649,10 @@ static void decode_and_transform_block_entity_r2004(HDWG hDwg, const unsigned ch
     case DWG_R2004_TYPE_LINE:   e = decode_line(hDwg, &bs);   break;
     case DWG_R2004_TYPE_CIRCLE: e = decode_circle(hDwg, &bs); break;
     case DWG_R2004_TYPE_ARC:    e = decode_arc(hDwg, &bs);    break;
-    case DWG_R2004_TYPE_ELLIPSE: e = decode_ellipse(hDwg, &bs); break;
     case DWG_R2004_TYPE_POINT:  e = decode_point(hDwg, &bs);  break;
     case DWG_R2004_TYPE_SOLID:  e = decode_solid(hDwg, &bs);  break;
     case DWG_R2004_TYPE_TEXT:   e = decode_text(hDwg, &bs, data, length, type_start_bit, bitsize);  break;
     case DWG_R2004_TYPE_MTEXT:  e = decode_mtext(hDwg, &bs, data, length, type_start_bit, bitsize); break;
-    case DWG_R2004_TYPE_LEADER: e = decode_leader(hDwg, &bs); break;
-    case DWG_R2004_TYPE_LWPOLYLINE: e = decode_lwpolyline(hDwg, &bs); break;
     default: break;
     }
 
@@ -1866,7 +1985,28 @@ static HENTITY decode_dimension(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long obj_
             dim_rotation = dwg_bs_read_bd(bs);
         else /* ALIGNED: no explicit dim_rotation field -- the dimension
                 line is always parallel to xline1_pt->xline2_pt. */
-            dim_rotation = atan2(xline2_pt.y - xline1_pt.y, xline2_pt.x - xline1_pt.x);
+        {
+            /* Real, confirmed bug found via this exact gap: a garbage/
+               misaligned candidate can produce xline1_pt == xline2_pt
+               (coincident, both individually "plausible" values, e.g.
+               both exactly (0,0,0) -- the same suspicious-default
+               pattern already found in decode_circle/decode_arc this
+               session), making atan2(0,0)'s two arguments both exactly
+               zero. That's a genuine mathematical domain edge case
+               (direction undefined for a zero-length segment); this
+               compiler's older runtime doesn't just return the IEEE-
+               correct 0.0, it prints "atan2: DOMAIN error" and, worse,
+               taints the result -- confirmed via a real crash-adjacent
+               symptom: 8 downstream LINE entities decoded with NaN
+               endpoints once the tainted dim_rotation propagated
+               through cos/sin below. Guarding the degenerate case
+               directly (skip atan2 entirely, default to 0.0) avoids
+               the runtime's own quirky DOMAIN-error path altogether,
+               rather than trying to sanitize its output after the
+               fact. */
+            double dx = xline2_pt.x - xline1_pt.x, dy = xline2_pt.y - xline1_pt.y;
+            dim_rotation = (dx == 0.0 && dy == 0.0) ? 0.0 : atan2(dy, dx);
+        }
         have_linear_geom = 1L;
     }
     else if (obj_type == DWG_R2004_TYPE_DIM_DIAMETER)
@@ -1961,8 +2101,20 @@ static HENTITY decode_dimension(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long obj_
 
         (void)oblique_angle;
 
+        /* Real, confirmed bug found via this exact gap: dim_rotation
+           (read directly off the bitstream for LINEAR, unlike ALIGNED's
+           now-guarded computed value just above) was never plausibility-
+           checked before feeding cos/sin -- a garbage angle propagates
+           straight through def_perp/xl1_perp/xl2_perp/delta1/delta2 into
+           dl1x/dl1y/dl2x/dl2y regardless of xline1_pt/xline2_pt
+           themselves being individually fine, producing NaN-endpoint
+           LINE entities (confirmed: 8 of them on a real file). Reusing
+           is_plausible_coord here for the same reason the ARC-angle fix
+           earlier this session did: a NaN-safe bounded-range check
+           applies just as well to an angle in radians as a coordinate. */
         if (is_plausible_coord(xline1_pt.x) && is_plausible_coord(xline1_pt.y) &&
-            is_plausible_coord(xline2_pt.x) && is_plausible_coord(xline2_pt.y))
+            is_plausible_coord(xline2_pt.x) && is_plausible_coord(xline2_pt.y) &&
+            is_plausible_coord(dim_rotation))
         {
             line_e = dwg_add_line(hDwg, xline1_pt.x, xline1_pt.y, xline1_pt.z, dl1x, dl1y, xline1_pt.z);
             if (line_e != NULL) apply_color(line_e, common->color);
@@ -2531,6 +2683,133 @@ static long r2004_find_handle_index(const DWG_R2004_HANDLE_ENTRY *entries, unsig
    same "own handle" signature the main decode loop's own
    `common.handle != handles[i].handle` check already relies on,
    without needing a full DWG_R2004_COMMON_ENTITY decode. */
+/* Orphan-candidate geometry check, mirroring R2000/R14's own r2000_
+   orphan_geometry_ok/r1314_orphan_geometry_ok this session already
+   built (see dwg_r2000_reader.c for the full "why": a candidate's own
+   decoded geometry is trustworthy evidence independent of whether its
+   handle matches anything a caller already expected). Reuses read_
+   common_entity_r2004 directly (already correct, proven everywhere
+   else in this file) to walk Common Entity Data, then duplicates just
+   the type-specific geometry field reads from decode_line/decode_
+   circle/decode_arc/decode_point/decode_solid (NOT calling those
+   functions themselves -- they need a real HDWG to attach the entity
+   to via dwg_add_*, and constructing/destroying a scratch document
+   per candidate across a whole-file scan of a million-plus byte
+   positions would be a real, needless allocation cost). Covers the
+   five types with their own existing plausibility-checked decoders --
+   the ones dominating this file's real content. Returns 1 (with
+   *out_handle set) if geometry looks genuinely real, 0 otherwise. */
+static long r2004_orphan_geometry_ok(const unsigned char *objects_buf, unsigned long objects_size,
+                                     unsigned long loc, unsigned long *out_handle)
+{
+    DWG_BITSTREAM bs;
+    unsigned long declared_length, obj_type;
+    DWG_R2004_COMMON_ENTITY common;
+
+    if (loc + 8UL >= objects_size)
+        return 0L;
+
+    dwg_bs_init(&bs, objects_buf, objects_size);
+    dwg_bs_seek_bit(&bs, loc * 8UL);
+
+    declared_length = dwg_bs_read_ms(&bs);
+    if (declared_length < 4UL || declared_length > objects_size)
+        return 0L;
+    (void)dwg_bs_read_mc(&bs, 0);
+    obj_type = read_object_type_r2010(&bs);
+
+    if (obj_type != DWG_R2004_TYPE_LINE && obj_type != DWG_R2004_TYPE_CIRCLE &&
+        obj_type != DWG_R2004_TYPE_ARC && obj_type != DWG_R2004_TYPE_POINT &&
+        obj_type != DWG_R2004_TYPE_SOLID)
+        return 0L;
+
+    if (!read_common_entity_r2004(&bs, &common))
+        return 0L;
+    if (common.handle == 0UL || common.handle > 200000UL)
+        return 0L;
+
+    if (obj_type == DWG_R2004_TYPE_LINE)
+    {
+        unsigned long z_is_zero;
+        double sx, sy, sz, ex, ey, ez;
+
+        z_is_zero = dwg_bs_read_bit(&bs);
+        sx = dwg_bs_read_rd(&bs);
+        ex = dwg_bs_read_dd(&bs, sx);
+        sy = dwg_bs_read_rd(&bs);
+        ey = dwg_bs_read_dd(&bs, sy);
+        if (z_is_zero == 0UL) { sz = dwg_bs_read_rd(&bs); ez = dwg_bs_read_dd(&bs, sz); }
+        else { sz = 0.0; ez = 0.0; }
+
+        if (!is_plausible_coord(sx) || !is_plausible_coord(sy) || !is_plausible_coord(sz) ||
+            !is_plausible_coord(ex) || !is_plausible_coord(ey) || !is_plausible_coord(ez))
+            return 0L;
+    }
+    else if (obj_type == DWG_R2004_TYPE_CIRCLE || obj_type == DWG_R2004_TYPE_ARC)
+    {
+        DWG_POINT3D center;
+        double radius, extra1 = 0.0, extra2 = 0.0;
+
+        dwg_bs_read_3bd(&bs, &center);
+        radius = dwg_bs_read_bd(&bs);
+        (void)dwg_bs_read_bt(&bs); /* thickness */
+        {
+            DWG_POINT3D extrusion;
+            dwg_bs_read_be(&bs, &extrusion);
+        }
+        if (obj_type == DWG_R2004_TYPE_ARC)
+        {
+            extra1 = dwg_bs_read_bd(&bs); /* start_angle */
+            extra2 = dwg_bs_read_bd(&bs); /* end_angle */
+        }
+
+        if (!is_plausible_coord(center.x) || !is_plausible_coord(center.y) || !is_plausible_coord(center.z) ||
+            !is_plausible_coord(radius) ||
+            (obj_type == DWG_R2004_TYPE_ARC && (!is_plausible_coord(extra1) || !is_plausible_coord(extra2))))
+            return 0L;
+        /* same origin-artifact guard as decode_circle/decode_arc (see
+           their own comment) -- a candidate whose center lands exactly
+           on (0,0,0) is a much stronger tell of a misaligned garbage
+           read than a real, deliberately-placed feature in this file. */
+        if (center.x == 0.0 && center.y == 0.0 && center.z == 0.0)
+            return 0L;
+    }
+    else if (obj_type == DWG_R2004_TYPE_POINT)
+    {
+        DWG_POINT3D p;
+
+        dwg_bs_read_3bd(&bs, &p);
+        (void)dwg_bs_read_bt(&bs);
+        {
+            DWG_POINT3D extrusion;
+            dwg_bs_read_be(&bs, &extrusion);
+        }
+        (void)dwg_bs_read_bd(&bs); /* X-axis angle */
+
+        if (!is_plausible_coord(p.x) || !is_plausible_coord(p.y) || !is_plausible_coord(p.z))
+            return 0L;
+    }
+    else /* SOLID */
+    {
+        double elevation, x1, y1, x2, y2, x3, y3, x4, y4;
+
+        (void)dwg_bs_read_bt(&bs); /* thickness */
+        elevation = dwg_bs_read_bd(&bs);
+        x1 = dwg_bs_read_rd(&bs); y1 = dwg_bs_read_rd(&bs);
+        x2 = dwg_bs_read_rd(&bs); y2 = dwg_bs_read_rd(&bs);
+        x3 = dwg_bs_read_rd(&bs); y3 = dwg_bs_read_rd(&bs);
+        x4 = dwg_bs_read_rd(&bs); y4 = dwg_bs_read_rd(&bs);
+
+        if (!is_plausible_coord(x1) || !is_plausible_coord(y1) || !is_plausible_coord(x2) || !is_plausible_coord(y2) ||
+            !is_plausible_coord(x3) || !is_plausible_coord(y3) || !is_plausible_coord(x4) || !is_plausible_coord(y4) ||
+            !is_plausible_coord(elevation))
+            return 0L;
+    }
+
+    *out_handle = common.handle;
+    return 1L;
+}
+
 static long r2004_offset_decodes_to_handle(const unsigned char *objects_buf, unsigned long objects_size,
                                            unsigned long offset, unsigned long expected_handle)
 {
@@ -2538,6 +2817,25 @@ static long r2004_offset_decodes_to_handle(const unsigned char *objects_buf, uns
     unsigned long declared_length;
     DWG_R2004_COMMON_ENTITY common;
 
+    /* NOTE, same session: a fix was attempted here (reject non-entity-
+       typed handles like LAYER, which this ENTITY-shaped check can't
+       validly judge -- return a distinct -1L "unverifiable" instead of
+       treating them as "stale") after that exact confusion was found
+       corrupting LAYER offsets (unresolved layer names spiking under
+       the collect-then-choose carving rewrite this session tried and
+       reverted). The fix was logically correct but, tested in
+       isolation with the ORIGINAL simple carve_missing_handles loop
+       restored, STILL regressed real content (entity_count 18,002 ->
+       16,370; VENTANAS 262 -> 16) -- some genuinely-corrupted entity
+       handles were apparently only getting repaired here via the same
+       type-mismatch coincidence that corrupts LAYER, and blocking it
+       uniformly blocked those repairs too. Reverted back to the
+       original, simpler 0/1-only form rather than trade one regression
+       for another -- the LAYER-corruption risk this was meant to fix
+       is real but narrower in practice than it first looked, and needs
+       a more targeted fix (e.g. protecting specifically LAYER-handle
+       lookups in resolve_r2004_layer_name itself, not this generic,
+       widely-used repair check) if revisited. */
     if (offset + 8UL >= objects_size)
         return 0L;
     dwg_bs_init(&bs, objects_buf, objects_size);
@@ -2571,12 +2869,111 @@ static long r2004_offset_decodes_to_handle(const unsigned char *objects_buf, uns
    hundreds of additional real LINE/MTEXT/INSERT/HATCH entities whose
    handles existed but pointed nowhere useful -- a much bigger class of
    corruption in this file than "missing entirely" alone. */
+/* UPDATE, same session: a first attempt to restructure this into a
+   collect-then-choose pass (relaxed length cap + geometry-verified
+   duplicate-handle disambiguation, mirroring R2000/R14's own orphan
+   salvage) was tried and REVERTED after it made things measurably
+   WORSE, not better -- entity_count dropped from 18,002 to 16,384 and
+   unresolved layer names jumped from 313 to 9,393/1,795 depending on
+   which fix was combined with which. Root cause of PART of that
+   regression was real and is kept fixed (r2004_offset_decodes_to_
+   handle now refuses to judge non-entity-typed handles like LAYER as
+   "stale" -- see its own comment), but the full restructuring
+   introduced other, not-yet-isolated regressions on top of that fix
+   and was rolled back to this known-good, simpler form rather than
+   ship something worse. r2004_orphan_geometry_ok (above) was built for
+   this attempt and is kept, unused for now -- a real, working,
+   independent geometry-plausibility check ready for a future, more
+   INCREMENTAL retry (one change at a time, re-measured after each,
+   instead of three changes landing together the way this attempt
+   did). */
+/* UPDATE, later session: Arturo confirmed "02_Planta 1 Baja_A3ver18.dwg"
+   (AC1032/R2018, same reader) is the SAME architectural design as the
+   R2000/R14 floor plans, just saved in a newer format -- so its own
+   DXF ground truth (`02_Planta 1 Baja_A3.dxf`) is valid to compare
+   against (unlike raw HANDLE numbers, which do NOT correspond between
+   independent saves -- confirmed the hard way: chasing "missing"
+   handles 208-223 by number led to unrelated real content that
+   happened to share those handle values in THIS save's own handle
+   space, not a bug). One-to-one coordinate recovery measured at 64.2%
+   (17,958/27,979 DXF lines), worst-hit layers PUERTAS 8/335 (2.4%),
+   LOSAS 47/230 (20%), VENTANAS 262/474 (55%) -- genuinely incomplete,
+   matching what Arturo reported directly.
+
+   Ran a deep diagnostic pass (since removed, all temporary) to find
+   the mechanism, and RULED OUT every hypothesis tested, each with
+   direct empirical evidence:
+   - Page/decompression coverage: 100% clean -- all 57 AcDb:AcDbObjects
+     pages (and both AcDb:Handles pages) found, decompressed, and
+     verified to reach at least their own declared decompressed_size
+     (only 2 of 57 pages under-produced, by 160 bytes each -- 320 bytes
+     total out of 1,668,586, nowhere near enough to explain a
+     ~10,000-object shortfall).
+   - Structural under-detection from the type/handle-range filters:
+     ruled out by re-scanning with those filters COMPLETELY removed
+     (only requiring a plausible declared_length and type==LINE) --
+     found the SAME ~18,260 LINE-type candidates, not more, meaning the
+     strict filters aren't the bottleneck.
+   - Hidden content under a different type code: ruled out by tallying
+     ALL type codes 0x00-0x5F across the whole buffer -- every code
+     shows the same ~100-250 "noise floor" (random-byte-alignment false
+     positives) except LINE (0x13, ~18,260, the real signal) and two
+     lesser peaks (0x00, 0x51) that are themselves noise-floor-shaped,
+     not a hidden alternate encoding. INSERT (0x07) specifically shows
+     ONLY 136 hits -- inside the noise floor, no real signal at all,
+     ruling out "PUERTAS are block references" as the explanation too.
+   - Direct coordinate hunt: decoded LINE geometry (ignoring handle/
+     length gates entirely, requiring only type==LINE) at every one of
+     those ~18,260 candidate positions and searched for a specific
+     known-missing DXF coordinate -- zero matches anywhere in the
+     buffer, and the single closest candidate (8cm away) was a
+     differently-shaped, unrelated line, not the same segment shifted.
+
+   Conclusion: the missing content genuinely is not encoded as
+   directly-decodable LINE geometry anywhere in this file's own
+   AcDb:AcDbObjects section -- this is NOT the same shape of bug as
+   the R2000/R14 handle-drift story (where the real objects
+   demonstrably existed and just needed better matching/resync). Given
+   R2004's own carve_missing_handles is already finding essentially
+   every real LINE-type object the buffer's own structure can yield
+   (~18,260 found vs ~18,002 decoded, a tight, expected gap -- not a
+   large one), further improvement here would need either (a) a
+   genuinely different theory not yet tested (e.g. deeper reverse-
+   engineering of the R2004 LZ77 variant beyond the page-level
+   completeness check already done), or (b) accepting this as a real,
+   currently-unexplained content gap specific to how this particular
+   file was saved, rather than a fixable reader bug. Not resolved this
+   session -- flagged clearly rather than guessed at further. */
 static unsigned long carve_missing_handles(const unsigned char *objects_buf, unsigned long objects_size,
                                            DWG_R2004_HANDLE_ENTRY *handles, unsigned long handle_count,
                                            unsigned long max_entries)
 {
     unsigned long pos, count;
     unsigned long original_count = handle_count;
+    unsigned int old_fpu_cw;
+
+    /* Real, confirmed crash found via this exact gap, same root cause
+       and same fix already applied to R2000/R14's own carving/salvage
+       scans this session (see dwg_r2000_reader.c's r2000_salvage_
+       orphan_candidates for the full story) -- this scan evaluates a
+       structural header at nearly EVERY byte position in the whole
+       objects section (over a million positions for a real file), the
+       overwhelming majority genuine false positives. r2004_offset_
+       decodes_to_handle -> read_common_entity_r2004 reads a real
+       double (ltype scale, dwg_bs_read_bd) as part of its own full
+       verification -- reading raw garbage bits as IEEE754 doubles can
+       and does produce signaling-NaN bit patterns at this scale, and
+       this compiler's/runtime's default FPU control word does NOT mask
+       the "invalid operand" exception, so merely reading/comparing
+       such a value traps and crashes the whole process (confirmed:
+       0xC0000090 STATUS_FLOAT_INVALID_OPERATION, NOT an integer divide
+       as first suspected -- misread that exit code myself before
+       checking the actual NTSTATUS value bit-for-bit). Never hit
+       before this session because carve_missing_handles wasn't
+       exercised against a file whose specific garbage-byte content
+       happened to land on a signaling-NaN pattern until Arturo's
+       AutoCAD-2018-exported file. */
+    old_fpu_cw = _control87(MCW_EM, MCW_EM);
 
     count = handle_count;
 
@@ -2607,8 +3004,7 @@ static unsigned long carve_missing_handles(const unsigned char *objects_buf, uns
             obj_type != DWG_R2004_TYPE_DIM_ORDINATE && obj_type != DWG_R2004_TYPE_DIM_LINEAR &&
             obj_type != DWG_R2004_TYPE_DIM_ALIGNED && obj_type != DWG_R2004_TYPE_DIM_ANG3PT &&
             obj_type != DWG_R2004_TYPE_DIM_ANG2LN && obj_type != DWG_R2004_TYPE_DIM_RADIUS &&
-            obj_type != DWG_R2004_TYPE_DIM_DIAMETER && obj_type != DWG_R2004_TYPE_BLOCK_HEADER &&
-            obj_type != DWG_R2004_TYPE_ELLIPSE && obj_type != DWG_R2004_TYPE_LEADER)
+            obj_type != DWG_R2004_TYPE_DIM_DIAMETER && obj_type != DWG_R2004_TYPE_BLOCK_HEADER)
             continue;
 
         dwg_bs_read_handle(&bs, &code, &value); /* an object's own handle is always code 0 (absolute) */
@@ -2647,6 +3043,7 @@ static unsigned long carve_missing_handles(const unsigned char *objects_buf, uns
     if (count > original_count)
         qsort(handles, (size_t)count, sizeof(DWG_R2004_HANDLE_ENTRY), r2004_handle_entry_cmp);
 
+    _control87(old_fpu_cw, MCW_EM);
     return count;
 }
 
@@ -2676,7 +3073,7 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
         return NULL;
     }
 
-    data = dwg_read_whole_file(path, &length);
+    data = read_whole_file(path, &length);
     if (data == NULL)
     {
         if (result != NULL) *result = DWG_IO_ERROR_OPEN;
@@ -2697,7 +3094,6 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
         if (result != NULL) *result = DWG_IO_ERROR_FORMAT;
         return NULL;
     }
-
     pagemap = (DWG_R2004_PAGE *)malloc(DWG_R2004_MAX_PAGES * sizeof(DWG_R2004_PAGE));
     sections = (DWG_R2004_SECTION *)malloc(DWG_R2004_MAX_SECTIONS * sizeof(DWG_R2004_SECTION));
     if (pagemap == NULL || sections == NULL)
@@ -2782,8 +3178,7 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
             obj_type != DWG_R2004_TYPE_DIM_ORDINATE && obj_type != DWG_R2004_TYPE_DIM_LINEAR &&
             obj_type != DWG_R2004_TYPE_DIM_ALIGNED && obj_type != DWG_R2004_TYPE_DIM_ANG3PT &&
             obj_type != DWG_R2004_TYPE_DIM_ANG2LN && obj_type != DWG_R2004_TYPE_DIM_RADIUS &&
-            obj_type != DWG_R2004_TYPE_DIM_DIAMETER && obj_type != DWG_R2004_TYPE_ELLIPSE &&
-            obj_type != DWG_R2004_TYPE_LEADER)
+            obj_type != DWG_R2004_TYPE_DIM_DIAMETER)
             continue;
 
         if (!read_common_entity_r2004(&bs, &common))
@@ -2797,18 +3192,17 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
         {
             char layer_name[256];
             long have_layer;
+            unsigned short layer_color = 0U;
 
             have_layer = resolve_r2004_layer_name(objects_buf, sec_objects->total_size, handles, handle_count,
-                                                  type_start_bit, bitsize, &common, layer_name, sizeof(layer_name));
+                                                  type_start_bit, bitsize, &common, layer_name, sizeof(layer_name),
+                                                  &layer_color);
 
             switch (obj_type)
             {
             case DWG_R2004_TYPE_LINE:   e = decode_line(hDwg, &bs);   break;
             case DWG_R2004_TYPE_CIRCLE: e = decode_circle(hDwg, &bs); break;
             case DWG_R2004_TYPE_ARC:    e = decode_arc(hDwg, &bs);    break;
-            case DWG_R2004_TYPE_ELLIPSE:
-                e = decode_ellipse(hDwg, &bs);
-                break;
             case DWG_R2004_TYPE_POINT:  e = decode_point(hDwg, &bs);  break;
             case DWG_R2004_TYPE_SOLID:  e = decode_solid(hDwg, &bs);  break;
             case DWG_R2004_TYPE_INSERT:
@@ -2831,9 +3225,6 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
             case DWG_R2004_TYPE_LWPOLYLINE:
                 e = decode_lwpolyline(hDwg, &bs);
                 break;
-            case DWG_R2004_TYPE_LEADER:
-                e = decode_leader(hDwg, &bs);
-                break;
             case DWG_R2004_TYPE_DIM_ORDINATE:
             case DWG_R2004_TYPE_DIM_LINEAR:
             case DWG_R2004_TYPE_DIM_ALIGNED:
@@ -2852,23 +3243,17 @@ HDWG dwg_read_dwg_r2004(const char *path, DWG_IO_RESULT *result)
 
             apply_color(e, common.color);
             if (have_layer)
+            {
                 dwg_entity_put_layer(e, layer_name);
 
-            /* Resolve STYLE for TEXT/MTEXT entities */
-            if (obj_type == DWG_R2004_TYPE_TEXT || obj_type == DWG_R2004_TYPE_MTEXT)
-            {
-                char style_name[256];
-                long have_style;
-
-                have_style = resolve_r2004_style_name(objects_buf, sec_objects->total_size, handles, handle_count,
-                                                      type_start_bit, bitsize, &common, style_name, sizeof(style_name));
-                if (have_style && style_name[0] != '\0')
-                {
-                    if (obj_type == DWG_R2004_TYPE_MTEXT)
-                        dwg_mtext_set_style_name(e, style_name);
-                    else
-                        dwg_text_set_style_name(e, style_name);
-                }
+                /* common.color==0/256 means BYBLOCK/BYLAYER -- apply_color
+                   above deliberately left the entity's own color unset in
+                   that case (same convention as R2000's own decode loop,
+                   see its identical comment) -- resolve the REAL color
+                   from the layer here instead, now that resolve_r2004_
+                   layer_name actually decodes it. */
+                if (common.color == 0U || common.color == 256U)
+                    apply_color(e, layer_color);
             }
         }
     }

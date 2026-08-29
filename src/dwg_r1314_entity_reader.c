@@ -13,7 +13,6 @@
 #include "dwg_vertex.h"
 #include "dwg_solid.h"
 #include "dwg_insert.h"
-#include "dwg_leader.h"
 #include "dwg_transform.h"
 
 #ifndef M_PI
@@ -33,11 +32,8 @@
 #define DWG_R1314_TYPE_LINE         0x13
 #define DWG_R1314_TYPE_POINT        0x1B
 #define DWG_R1314_TYPE_SOLID        0x1F
-#define DWG_R1314_TYPE_ELLIPSE       0x1A
-#define DWG_R1314_TYPE_LEADER        0x26
 #define DWG_R1314_TYPE_BLOCK_HEADER 0x31
 #define DWG_R1314_TYPE_LAYER        0x33
-#define DWG_R1314_TYPE_STYLE        0x35
 
 #define DWG_R1314_MAX_LAYER_NAME 256
 #define DWG_R1314_MAX_BLOCK_NAME 256
@@ -68,7 +64,67 @@
    story (a garbage Numreactors value from a stale object-map entry
    drove a `for` loop billions of iterations, no inherent bound). */
 #define DWG_R1314_MAX_REACTORS 1000UL
-#define DWG_R1314_MAX_LEADER_VERTICES 100000UL
+
+/* Coordinate sanity check -- see dwg_r2000_entity_reader.c's identical
+   is_plausible_coord for the full rationale (real, visible bug: a
+   stale object-map entry's garbage bytes decoded a LINE with
+   coordinates like 1e101/1e87, which dominated zoom-to-fit and scaled
+   the entire real drawing down to an invisible point). Same 10M
+   threshold, same reasoning, applied here too since R13/R14 files hit
+   the identical object-map-noise phenomenon. Moved up here (from its
+   original spot right before decode_line_r1314) so the carving
+   section below can also use it as a duplicate-handle disambiguator,
+   not just as the final entity-acceptance gate. */
+#define DWG_R1314_MAX_PLAUSIBLE_COORD 1.0e7
+
+static int is_plausible_coord(double v)
+{
+    return v > -DWG_R1314_MAX_PLAUSIBLE_COORD && v < DWG_R1314_MAX_PLAUSIBLE_COORD;
+}
+
+/* Real, confirmed bug: a TEXT entry whose object-map location got
+   resynced to a WRONG-but-structurally-valid candidate (byte-position
+   guessing has no per-type awareness of TEXT the way is_plausible_
+   coord already gates numeric fields) decodes WHATEVER bytes are
+   there as a string. Its coordinates can easily still pass the loose
+   is_plausible_coord bound, so garbage text was rendering directly on
+   real drawings (Arturo caught one: a large "K{r0" floating in the
+   middle of a floor plan). A pure "reject non-alphanumeric" filter
+   doesn't catch this specific case (K, r, 0 ARE alphanumeric) -- what
+   actually distinguishes it from real architectural labels ("Dia",
+   "Aprob.", room names, "%%d"-style codes) is a handful of symbol
+   characters that are legitimate DWG text but vanishingly rare in
+   practice for THIS kind of content: braces, pipes, tildes, carets,
+   backslashes, angle brackets, backticks. Also rejects raw control
+   characters outright (never legitimate in a text label) and pure-
+   symbol strings with no letter or digit at all. Not a perfect
+   detector -- garbage that happens to avoid all of these would still
+   slip through -- but a real, cheap, safe improvement over no check
+   at all. */
+static int is_plausible_text(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    int has_alnum = 0;
+    int is_empty = 1;
+
+    for (; *p != '\0'; p++)
+    {
+        unsigned char c = *p;
+        is_empty = 0;
+
+        if (c < 0x09U || (c > 0x0DU && c < 0x20U) || c == 0x7FU)
+            return 0; /* raw control character -- never real text */
+
+        if (c == '{' || c == '}' || c == '|' || c == '~' || c == '^' ||
+            c == '\\' || c == '<' || c == '>' || c == '`')
+            return 0; /* legitimate DWG text chars, but vanishingly rare here */
+
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+            has_alnum = 1;
+    }
+
+    return is_empty ? 1 : has_alnum;
+}
 
 typedef struct
 {
@@ -80,13 +136,6 @@ typedef struct
     unsigned long isbylayerlt;
     unsigned long nolinks;
 } DWG_R1314_COMMON_ENTITY;
-
-/* Forward declaration for decode_polyline2d_r1314 which is called from
-   decode_and_transform_block_entity_r1314 but defined later. */
-static HENTITY decode_polyline2d_r1314(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long ms_end_bit,
-                                        const DWG_R1314_COMMON_ENTITY *common,
-                                        const unsigned char *data, unsigned long length,
-                                        const DWG_R2000_OBJMAP *objmap);
 
 static void skip_eed_blocks(DWG_BITSTREAM *bs, unsigned short first_length)
 {
@@ -137,12 +186,116 @@ static int r1314_carve_cmp(const void *a, const void *b)
     return 0;
 }
 
-/* Peeks just far enough to read a candidate object's own handle,
-   using R14's real order (Type -> Handle), unlike R2000's (Type ->
-   obj_size -> Handle). Doesn't need to skip EED/preview at all for
-   this purpose -- the handle comes BEFORE either of those here. */
+/* Same class-count-aware tightening as R2000's r2000_max_class_type
+   (see dwg_r2000_reader.c for the full reasoning: a real file only
+   ever registers a handful of classes -- 9 for this file, ending at
+   type 508 -- so allowing the WHOLE theoretical 500-4999 range as
+   "plausible" let unrelated, coincidentally-self-consistent byte
+   patterns masquerade as real class-based objects). Reuses the same
+   R13-R15 Classes section layout dwg_r2000_reader.c's own version
+   parses (shared file structure, confirmed by dwg_r2000_parse_header's
+   own comment). */
+static unsigned short r1314_max_class_type(const unsigned char *data, unsigned long length)
+{
+    DWG_R2000_HEADER header;
+    const DWG_R2000_SECTION_RECORD *crec;
+    DWG_BITSTREAM cbs;
+    unsigned long cpos, idx = 0UL;
+
+    if (!dwg_r2000_parse_header(data, length, &header))
+        return 4999U;
+
+    crec = dwg_r2000_find_record(&header, 1U);
+    if (crec == NULL)
+        return 4999U;
+
+    cpos = crec->seeker + 16UL;
+    if (cpos + 4UL >= length)
+        return 4999U;
+
+    dwg_bs_init(&cbs, data, length);
+    dwg_bs_seek_bit(&cbs, cpos * 8UL);
+    (void)dwg_bs_read_rl(&cbs); /* class_size, not needed here */
+
+    while (idx < 1000UL)
+    {
+        unsigned long classnum;
+        char appname[128], cppname[128], dxfname[128];
+
+        classnum = dwg_bs_read_bs(&cbs);
+        if (classnum == 0UL || classnum > 10000UL)
+            break;
+        (void)dwg_bs_read_bs(&cbs); /* version */
+        (void)dwg_bs_read_t(&cbs, appname, sizeof(appname));
+        (void)dwg_bs_read_t(&cbs, cppname, sizeof(cppname));
+        (void)dwg_bs_read_t(&cbs, dxfname, sizeof(dxfname));
+        (void)dwg_bs_read_bit(&cbs);  /* wasazombie */
+        (void)dwg_bs_read_bs(&cbs);   /* itemclassid */
+        idx++;
+    }
+
+    return (idx == 0UL) ? 500U : (unsigned short)(500UL + idx - 1UL);
+}
+
+/* Reads Common Entity Data from right after the object's OWN handle
+   (already consumed by the caller) through Invisibility, mirroring
+   read_common_entity_data_r1314's exact field order but without
+   allocating a DWG_R1314_COMMON_ENTITY -- used only to decide whether
+   a CANDIDATE location's data looks real, not to actually build an
+   entity. Returns 0 on any structurally-implausible field (numreactors
+   way too large), 1 otherwise, leaving `bs` positioned right after
+   Invisibility, same as the real function does. */
+static long r1314_validate_common_fields(DWG_BITSTREAM *bs)
+{
+    unsigned short eed_size;
+    unsigned long preview_exists;
+    unsigned long numreactors;
+
+    eed_size = dwg_bs_read_bs(bs);
+    if (eed_size != 0U)
+        skip_eed_blocks(bs, eed_size);
+
+    preview_exists = dwg_bs_read_bit(bs);
+    if (preview_exists != 0UL)
+    {
+        unsigned long preview_size = dwg_bs_read_rl(bs);
+        if (preview_size > 0x7FFFFFFFUL)
+            return 0L;
+        dwg_bs_seek_bit(bs, dwg_bs_tell_bit(bs) + preview_size * 8UL);
+    }
+
+    (void)dwg_bs_read_rl(bs); /* obj_size_bits */
+    (void)dwg_bs_read_bb(bs); /* entmode */
+    numreactors = dwg_bs_read_bl(bs);
+    if (numreactors > DWG_R1314_MAX_REACTORS)
+        return 0L;
+    (void)dwg_bs_read_bit(bs); /* isbylayerlt */
+    (void)dwg_bs_read_bit(bs); /* nolinks */
+    (void)dwg_bs_read_bs(bs);  /* color */
+    (void)dwg_bs_read_bd(bs);  /* ltscale */
+    (void)dwg_bs_read_bs(bs);  /* invisibility */
+
+    return 1L;
+}
+
+/* Peeks a candidate object's own handle, using R14's real order (Type
+   -> Handle), unlike R2000's (Type -> obj_size -> Handle). ALSO now
+   validates the rest of Common Entity Data (r1314_validate_common_
+   fields) before accepting the candidate -- real, confirmed
+   improvement: the shallower MS+BS+H-only check let far too many
+   coincidental byte patterns "pass" (measured 90,809 candidates for
+   an implied ~57,937 real objects on `03_Planta 2 Alta_A3.dwg`, a
+   4MB file -- much higher false-positive density than the smaller
+   1.7MB R2000 file's 34,027-candidate pool, both counted the same
+   way; see test_carve_duplicates.exe / test_carve_duplicates_r2000.exe).
+   Continuing to validate numreactors (a field with real, tight bounds
+   for genuine objects but essentially unconstrained garbage otherwise)
+   costs only a few more bitstream reads per candidate but rejects a
+   meaningful share of false positives before they ever enter the
+   duplicate-prone shared index, directly reducing handle collisions
+   for every other real entry too. */
 static long r1314_peek_handle(const unsigned char *data, unsigned long length, unsigned long loc,
-                              unsigned long *out_handle)
+                              unsigned long *out_handle, unsigned short max_class_type)
 {
     DWG_BITSTREAM bs;
     unsigned long len;
@@ -159,18 +312,96 @@ static long r1314_peek_handle(const unsigned char *data, unsigned long length, u
     if (len < 4UL || len > length)
         return 0L;
     type = dwg_bs_read_bs(&bs);
-    if (!((type >= 1U && type <= 0x52U) || type == 0x1F2U || type == 0x1F3U || (type >= 500U && type < 5000U)))
+    if (!((type >= 1U && type <= 0x52U) || type == 0x1F2U || type == 0x1F3U || (type >= 500U && type <= max_class_type)))
         return 0L;
     dwg_bs_read_handle(&bs, &code, &value);
     if (code != 0U || value == 0UL || value > 5000000UL)
+        return 0L;
+
+    if (!r1314_validate_common_fields(&bs))
         return 0L;
 
     *out_handle = value;
     return 1L;
 }
 
+/* Scores a candidate location's trustworthiness for disambiguating
+   duplicate handles (see r1314_carve_lookup below): decodes the
+   candidate's actual entity-specific coordinate fields, for the
+   coordinate-bearing types that dominate real content (LINE/ARC/
+   CIRCLE/POINT), and checks them against the SAME is_plausible_coord
+   gate the real decoders already use to reject garbage at final
+   acceptance time -- just applied here, earlier, as a disambiguator
+   instead of a final accept/reject. Returns 2 (high confidence: type
+   is coordinate-bearing AND coordinates are plausible), 0 (low
+   confidence: type is coordinate-bearing but coordinates are
+   garbage -- a strong signal this candidate is a structural false
+   positive, not the real object), or 1 (neutral: type isn't one this
+   function knows how to geometrically verify, e.g. LAYER/TEXT/INSERT
+   -- no opinion either way). */
+static int r1314_candidate_confidence(const unsigned char *data, unsigned long length, unsigned long loc)
+{
+    DWG_BITSTREAM bs;
+    unsigned long len;
+    unsigned short type;
+    unsigned char hcode;
+    unsigned long hvalue;
+
+    if (loc + 16UL >= length)
+        return 1;
+
+    dwg_bs_init(&bs, data, length);
+    dwg_bs_seek_bit(&bs, loc * 8UL);
+    len = dwg_bs_read_ms(&bs);
+    if (len < 4UL || len > length)
+        return 1;
+    type = dwg_bs_read_bs(&bs);
+
+    if (type != DWG_R1314_TYPE_LINE && type != DWG_R1314_TYPE_ARC &&
+        type != DWG_R1314_TYPE_CIRCLE && type != DWG_R1314_TYPE_POINT)
+        return 1; /* not a type this function checks -- no opinion */
+
+    dwg_bs_read_handle(&bs, &hcode, &hvalue);
+
+    if (!r1314_validate_common_fields(&bs))
+        return 0; /* garbage numreactors etc -- definitely not real */
+
+    if (type == DWG_R1314_TYPE_LINE)
+    {
+        DWG_POINT3D start, end;
+        dwg_bs_read_3bd(&bs, &start);
+        dwg_bs_read_3bd(&bs, &end);
+        return (is_plausible_coord(start.x) && is_plausible_coord(start.y) && is_plausible_coord(start.z) &&
+                is_plausible_coord(end.x) && is_plausible_coord(end.y) && is_plausible_coord(end.z)) ? 2 : 0;
+    }
+    else if (type == DWG_R1314_TYPE_CIRCLE)
+    {
+        DWG_POINT3D center;
+        double radius;
+        dwg_bs_read_3bd(&bs, &center);
+        radius = dwg_bs_read_bd(&bs);
+        return (is_plausible_coord(center.x) && is_plausible_coord(center.y) && is_plausible_coord(center.z) &&
+                is_plausible_coord(radius)) ? 2 : 0;
+    }
+    else if (type == DWG_R1314_TYPE_ARC)
+    {
+        DWG_POINT3D center;
+        double radius;
+        dwg_bs_read_3bd(&bs, &center);
+        radius = dwg_bs_read_bd(&bs);
+        return (is_plausible_coord(center.x) && is_plausible_coord(center.y) && is_plausible_coord(center.z) &&
+                is_plausible_coord(radius)) ? 2 : 0;
+    }
+    else /* DWG_R1314_TYPE_POINT */
+    {
+        DWG_POINT3D p;
+        dwg_bs_read_3bd(&bs, &p);
+        return (is_plausible_coord(p.x) && is_plausible_coord(p.y) && is_plausible_coord(p.z)) ? 2 : 0;
+    }
+}
+
 static R1314_CARVE_ENTRY *r1314_build_carve_index(const unsigned char *data, unsigned long length,
-                                                   unsigned long *out_count)
+                                                   unsigned long *out_count, unsigned short max_class_type)
 {
     unsigned long pos, count = 0UL, capacity = 65536UL;
     R1314_CARVE_ENTRY *arr = (R1314_CARVE_ENTRY *)malloc(capacity * sizeof(R1314_CARVE_ENTRY));
@@ -182,7 +413,7 @@ static R1314_CARVE_ENTRY *r1314_build_carve_index(const unsigned char *data, uns
     for (pos = 0UL; pos + 8UL < length; pos++)
     {
         unsigned long handle;
-        if (!r1314_peek_handle(data, length, pos, &handle))
+        if (!r1314_peek_handle(data, length, pos, &handle, max_class_type))
             continue;
 
         if (count >= capacity)
@@ -204,33 +435,93 @@ static R1314_CARVE_ENTRY *r1314_build_carve_index(const unsigned char *data, uns
     return arr;
 }
 
-static long r1314_carve_lookup(const R1314_CARVE_ENTRY *arr, unsigned long count,
-                               unsigned long handle, unsigned long *out_loc)
+/* Same fix as R2000's own r2000_carve_lookup (see dwg_r2000_reader.c
+   for the full reasoning): a handle alone is far from a unique key in
+   this index -- small handles need very few bits to encode, so
+   accidentally-matching candidates are common in a dense binary file.
+   Confirmed on `03_Planta 2 Alta_A3.dwg` (test_carve_duplicates.exe):
+   68% of all 90,809 carve candidates share their handle with at least
+   one other candidate, one handle alone had 2,313 "matches" scattered
+   across the whole 4MB file. Blindly returning whichever duplicate a
+   binary search lands on attaches a real, structurally-valid-looking
+   but WRONG object's geometry to the entry -- renders as plausible
+   content in the WRONG place, not obvious garbage (this is what
+   produced visibly "out of position" elements Arturo caught in a
+   real screenshot).
+
+   Fix, two-tier: FIRST prefer candidates with the highest
+   r1314_candidate_confidence score (2 = decodes as a coordinate-
+   bearing type with plausible coordinates, 0 = decodes as one of
+   those types but with garbage coordinates -- a strong, direct
+   signal, not a guess; 1 = an unchecked type, no opinion). Among
+   candidates tied at the best confidence tier found, THEN pick the
+   one closest to `reference_loc` (the entry's own pre-repair
+   location) as the final tiebreaker -- same proximity heuristic as
+   before, now only deciding between genuinely-plausible candidates
+   instead of blindly first. */
+static long r1314_carve_lookup(const unsigned char *data, unsigned long length,
+                               const R1314_CARVE_ENTRY *arr, unsigned long count,
+                               unsigned long handle, unsigned long reference_loc,
+                               unsigned long *out_loc)
 {
     long lo = 0L, hi = (long)count - 1L;
+    long found = -1L;
 
     while (lo <= hi)
     {
         long mid = lo + (hi - lo) / 2L;
         if (arr[mid].handle == handle)
         {
-            *out_loc = arr[mid].location;
-            return 1L;
+            found = mid;
+            break;
         }
         if (arr[mid].handle < handle)
             lo = mid + 1L;
         else
             hi = mid - 1L;
     }
-    return 0L;
+
+    if (found < 0L)
+        return 0L;
+
+    {
+        long first = found, last = found;
+        long best = -1L;
+        int best_conf = -1;
+        unsigned long best_dist = 0UL;
+        long k;
+
+        while (first > 0L && arr[first - 1L].handle == handle)
+            first--;
+        while ((unsigned long)last + 1UL < count && arr[last + 1L].handle == handle)
+            last++;
+
+        for (k = first; k <= last; k++)
+        {
+            int conf = r1314_candidate_confidence(data, length, arr[k].location);
+            unsigned long dist = (arr[k].location > reference_loc) ?
+                                 (arr[k].location - reference_loc) : (reference_loc - arr[k].location);
+
+            if (conf > best_conf || (conf == best_conf && dist < best_dist))
+            {
+                best_conf = conf;
+                best_dist = dist;
+                best = k;
+            }
+        }
+
+        *out_loc = arr[best].location;
+        return 1L;
+    }
 }
 
 static void r1314_repair_objmap(const unsigned char *data, unsigned long length, DWG_R2000_OBJMAP *objmap)
 {
     R1314_CARVE_ENTRY *carve_index;
     unsigned long carve_count, i;
+    unsigned short max_class_type = r1314_max_class_type(data, length);
 
-    carve_index = r1314_build_carve_index(data, length, &carve_count);
+    carve_index = r1314_build_carve_index(data, length, &carve_count, max_class_type);
     if (carve_index == NULL)
         return;
 
@@ -238,11 +529,11 @@ static void r1314_repair_objmap(const unsigned char *data, unsigned long length,
     {
         unsigned long existing_handle, carved_loc;
 
-        if (r1314_peek_handle(data, length, objmap->entries[i].location, &existing_handle) &&
+        if (r1314_peek_handle(data, length, objmap->entries[i].location, &existing_handle, max_class_type) &&
             existing_handle == objmap->entries[i].handle)
             continue; /* already correct */
 
-        if (r1314_carve_lookup(carve_index, carve_count, objmap->entries[i].handle, &carved_loc))
+        if (r1314_carve_lookup(data, length, carve_index, carve_count, objmap->entries[i].handle, objmap->entries[i].location, &carved_loc))
             objmap->entries[i].location = carved_loc;
     }
 
@@ -289,14 +580,9 @@ static int read_common_entity_data_r1314(DWG_BITSTREAM *bs, DWG_R1314_COMMON_ENT
     if (preview_exists != 0UL)
     {
         unsigned long preview_size = dwg_bs_read_rl(bs);
-        unsigned long cur_bit, preview_bits;
-        if (preview_size > 100000000UL)
+        if (preview_size > 0x7FFFFFFFUL)
             return 0;
-        preview_bits = preview_size * 8UL;
-        cur_bit = dwg_bs_tell_bit(bs);
-        if (cur_bit + preview_bits < cur_bit)
-            return 0;
-        dwg_bs_seek_bit(bs, cur_bit + preview_bits);
+        dwg_bs_seek_bit(bs, dwg_bs_tell_bit(bs) + preview_size * 8UL);
     }
 
     out->obj_size_bits = dwg_bs_read_rl(bs);
@@ -410,20 +696,6 @@ static void apply_color(HENTITY e, unsigned short color)
         dwg_entity_put_color(e, color);
 }
 
-/* Coordinate sanity check -- see dwg_r2000_entity_reader.c's identical
-   is_plausible_coord for the full rationale (real, visible bug: a
-   stale object-map entry's garbage bytes decoded a LINE with
-   coordinates like 1e101/1e87, which dominated zoom-to-fit and scaled
-   the entire real drawing down to an invisible point). Same 10M
-   threshold, same reasoning, applied here too since R13/R14 files hit
-   the identical object-map-noise phenomenon. */
-#define DWG_R1314_MAX_PLAUSIBLE_COORD 1.0e7
-
-static int is_plausible_coord(double v)
-{
-    return v > -DWG_R1314_MAX_PLAUSIBLE_COORD && v < DWG_R1314_MAX_PLAUSIBLE_COORD;
-}
-
 /* LINE (0x13): R13-R14 field layout is plain Start/End 3BD points, not
    R2000's Z's-are-zero-bit + DD-default scheme. */
 static HENTITY decode_line_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
@@ -456,6 +728,12 @@ static HENTITY decode_circle_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
         !is_plausible_coord(radius))
         return NULL;
 
+    /* Same real false-positive fixed in the R2000 reader's own copy of
+       this check (dwg_r2000_entity_reader.c's decode_circle) -- see
+       its comment for the full reasoning. */
+    if (center.x == 0.0 && center.y == 0.0 && center.z == 0.0)
+        return NULL;
+
     return dwg_add_circle(hDwg, center.x, center.y, center.z, radius);
 }
 
@@ -471,85 +749,23 @@ static HENTITY decode_arc_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
     start_angle_rad = dwg_bs_read_bd(bs);
     end_angle_rad = dwg_bs_read_bd(bs);
 
+    /* Same real hang fixed in decode_arc's own copy of this check
+       (dwg_r2000_entity_reader.c) -- angles were never validated, and
+       an unvalidated garbage angle from a resync/salvage candidate can
+       make draw_arc's sweep normalization loop effectively forever, or
+       feed an undefined-behavior segment-count cast if it escapes. */
     if (!is_plausible_coord(center.x) || !is_plausible_coord(center.y) || !is_plausible_coord(center.z) ||
-        !is_plausible_coord(radius))
+        !is_plausible_coord(radius) || !is_plausible_coord(start_angle_rad) || !is_plausible_coord(end_angle_rad))
+        return NULL;
+
+    /* Same real false-positive fixed in decode_circle_r1314's own copy
+       of this check just above -- see the R2000 decode_circle comment
+       (dwg_r2000_entity_reader.c) for the full reasoning. */
+    if (center.x == 0.0 && center.y == 0.0 && center.z == 0.0)
         return NULL;
 
     return dwg_add_arc(hDwg, center.x, center.y, center.z, radius,
                        start_angle_rad * 180.0 / M_PI, end_angle_rad * 180.0 / M_PI);
-}
-
-static HENTITY decode_ellipse_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
-{
-    DWG_POINT3D center, major_axis;
-    double axis_ratio, start_param, end_param;
-
-    dwg_bs_read_3bd(bs, &center);
-    dwg_bs_read_3bd(bs, &major_axis);
-    axis_ratio = dwg_bs_read_bd(bs);
-    start_param = dwg_bs_read_bd(bs);
-    end_param = dwg_bs_read_bd(bs);
-
-    if (!is_plausible_coord(center.x) || !is_plausible_coord(center.y) || !is_plausible_coord(center.z) ||
-        !is_plausible_coord(major_axis.x) || !is_plausible_coord(major_axis.y) || !is_plausible_coord(major_axis.z))
-        return NULL;
-
-    return dwg_add_ellipse(hDwg, center.x, center.y, center.z,
-                           major_axis.x, major_axis.y, major_axis.z,
-                           axis_ratio, start_param, end_param);
-}
-
-static HENTITY decode_leader_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
-{
-    unsigned char class_version;
-    double arrow_size;
-    unsigned short path_type, creation_type;
-    unsigned char annot_handle_code;
-    unsigned long annot_handle_value;
-    unsigned long num_vertex, i;
-    HENTITY e;
-
-    class_version = dwg_bs_read_rc(bs);
-    arrow_size = dwg_bs_read_bd(bs);
-    path_type = dwg_bs_read_bs(bs);
-    creation_type = dwg_bs_read_bs(bs);
-    (void)path_type; (void)creation_type;
-
-    dwg_bs_read_handle(bs, &annot_handle_code, &annot_handle_value);
-
-    num_vertex = dwg_bs_read_bl(bs);
-    if (num_vertex > DWG_R1314_MAX_LEADER_VERTICES)
-        num_vertex = DWG_R1314_MAX_LEADER_VERTICES;
-
-    e = dwg_add_leader(hDwg);
-    if (e == NULL)
-        return NULL;
-
-    dwg_leader_set_arrow_size(e, arrow_size);
-
-    for (i = 0UL; i < num_vertex; i++)
-    {
-        DWG_POINT3D pt;
-        dwg_bs_read_3bd(bs, &pt);
-        if (!is_plausible_coord(pt.x) || !is_plausible_coord(pt.y) || !is_plausible_coord(pt.z))
-        {
-            dwg_entity_destroy(e);
-            return NULL;
-        }
-        dwg_leader_add_vertex(e, pt.x, pt.y, pt.z);
-    }
-
-    {
-        DWG_POINT3D extrusion;
-        dwg_bs_read_3bd(bs, &extrusion);
-    }
-    {
-        DWG_POINT3D xto_dir;
-        dwg_bs_read_3bd(bs, &xto_dir);
-    }
-    (void)dwg_bs_read_bs(bs);
-
-    return e;
 }
 
 static HENTITY decode_point_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
@@ -630,7 +846,7 @@ static HENTITY decode_text_r1314(HDWG hDwg, DWG_BITSTREAM *bs)
     (void)dwg_bs_read_bs(bs); /* vertical align: not modeled */
 
     if (!is_plausible_coord(ins.x) || !is_plausible_coord(ins.y) || !is_plausible_coord(elevation) ||
-        !is_plausible_coord(height))
+        !is_plausible_coord(height) || !is_plausible_text(text_buf))
         return NULL;
 
     e = dwg_add_text(hDwg, ins.x, ins.y, elevation, height, rotation_rad * 180.0 / M_PI, text_buf);
@@ -780,7 +996,6 @@ static int decode_and_transform_block_entity_r1314(HDWG hDwg, const unsigned cha
                                                     double ins_x, double ins_y, double ins_z,
                                                     double scale_x, double scale_y, double scale_z,
                                                     double rotation_deg,
-                                                    const DWG_R2000_OBJMAP *objmap,
                                                     unsigned long *next_handle)
 {
     DWG_BITSTREAM bs;
@@ -796,29 +1011,21 @@ static int decode_and_transform_block_entity_r1314(HDWG hDwg, const unsigned cha
     ms_end_bit = dwg_bs_tell_bit(&bs);
     obj_type = dwg_bs_read_bs(&bs);
 
-    if (!read_common_entity_data_r1314(&bs, &common))
-        return 0;
-
     if (obj_type != DWG_R1314_TYPE_LINE && obj_type != DWG_R1314_TYPE_CIRCLE &&
         obj_type != DWG_R1314_TYPE_ARC && obj_type != DWG_R1314_TYPE_POINT &&
-        obj_type != DWG_R1314_TYPE_SOLID && obj_type != DWG_R1314_TYPE_ELLIPSE &&
-        obj_type != DWG_R1314_TYPE_TEXT && obj_type != DWG_R1314_TYPE_POLYLINE2D &&
-        obj_type != DWG_R1314_TYPE_INSERT)
-    {
-        *next_handle = find_entity_next_handle_r1314(&bs, ms_end_bit, &common, cur_handle);
-        return 1;
-    }
+        obj_type != DWG_R1314_TYPE_SOLID)
+        return 0;
+
+    if (!read_common_entity_data_r1314(&bs, &common))
+        return 0;
 
     switch (obj_type)
     {
     case DWG_R1314_TYPE_LINE:   e = decode_line_r1314(hDwg, &bs);   break;
     case DWG_R1314_TYPE_CIRCLE: e = decode_circle_r1314(hDwg, &bs); break;
     case DWG_R1314_TYPE_ARC:    e = decode_arc_r1314(hDwg, &bs);    break;
-    case DWG_R1314_TYPE_ELLIPSE: e = decode_ellipse_r1314(hDwg, &bs); break;
     case DWG_R1314_TYPE_POINT:  e = decode_point_r1314(hDwg, &bs);  break;
     case DWG_R1314_TYPE_SOLID:  e = decode_solid_r1314(hDwg, &bs);  break;
-    case DWG_R1314_TYPE_TEXT:    e = decode_text_r1314(hDwg, &bs);   break;
-    case DWG_R1314_TYPE_POLYLINE2D: e = decode_polyline2d_r1314(hDwg, &bs, ms_end_bit, &common, data, length, objmap); break;
     default: break;
     }
 
@@ -837,7 +1044,44 @@ static int decode_and_transform_block_entity_r1314(HDWG hDwg, const unsigned cha
     return 1;
 }
 
-/* read_whole_file removed -- use dwg_read_whole_file from dwg_file_io.c */
+static unsigned char *read_whole_file(const char *path, unsigned long *out_length)
+{
+    FILE *fp;
+    long size;
+    unsigned char *buf;
+
+    fp = fopen(path, "rb");
+    if (fp == NULL)
+        return NULL;
+
+    fseek(fp, 0, SEEK_END);
+    size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (size < 0)
+    {
+        fclose(fp);
+        return NULL;
+    }
+
+    buf = (unsigned char *)malloc((size_t)size);
+    if (buf == NULL)
+    {
+        fclose(fp);
+        return NULL;
+    }
+
+    if (fread(buf, 1, (size_t)size, fp) != (size_t)size)
+    {
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+
+    fclose(fp);
+    *out_length = (unsigned long)size;
+    return buf;
+}
 
 /* Binary search, not linear -- see the identical comment in
    dwg_r2000_entity_reader.c's own objmap_find, same root cause and
@@ -980,8 +1224,8 @@ static HENTITY decode_insert_r1314(HDWG hDwg, DWG_BITSTREAM *bs, unsigned long m
                 break;
 
             if (!decode_and_transform_block_entity_r1314(hDwg, data, length, eloc, cur, &block_base_pt,
-                                                          ins.x, ins.y, ins.z, sx, sy, sz,
-                                                          rotation_rad * 180.0 / M_PI, objmap, &next))
+                                                         ins.x, ins.y, ins.z, sx, sy, sz,
+                                                         rotation_rad * 180.0 / M_PI, &next))
                 break;
 
             if (reached_last)
@@ -1195,7 +1439,7 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
         return NULL;
     }
 
-    data = dwg_read_whole_file(path, &length);
+    data = read_whole_file(path, &length);
     if (data == NULL)
     {
         if (result != NULL) *result = DWG_IO_ERROR_OPEN;
@@ -1218,40 +1462,13 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
         return NULL;
     }
 
-    if (!dwg_r2000_parse_object_map(data, length, objmap_rec->seeker, objmap_rec->size, &objmap))
+    if (!dwg_r1314_parse_object_map(data, length, objmap_rec->seeker, objmap_rec->size, &objmap))
     {
         free(data);
         if (result != NULL) *result = DWG_IO_ERROR_MEMORY;
         return NULL;
     }
     r1314_repair_objmap(data, length, &objmap);
-
-#ifdef DBGPROXYFIND
-    {
-        unsigned long pos, found = 0UL;
-        for (pos = 0UL; pos + 16UL < length && found < 5UL; pos++)
-        {
-            DWG_BITSTREAM pbs;
-            unsigned long plen;
-            unsigned short ptype;
-            unsigned char pcode;
-            unsigned long pvalue;
-
-            dwg_bs_init(&pbs, data, length);
-            dwg_bs_seek_bit(&pbs, pos * 8UL);
-            plen = dwg_bs_read_ms(&pbs);
-            if (plen < 4UL || plen > length) continue;
-            ptype = dwg_bs_read_bs(&pbs);
-            if (ptype != 0x1F2U) continue;
-            dwg_bs_read_handle(&pbs, &pcode, &pvalue);
-            if (pcode != 0U || pvalue == 0UL || pvalue > 5000000UL) continue;
-
-            printf("DBGPROXYFIND #%lu pos=%lu handle=%lu\n", found, pos, pvalue);
-            found++;
-        }
-        printf("DBGPROXYFIND total_found=%lu\n", found);
-    }
-#endif
 
     hDwg = dwg_document_create();
     if (hDwg == NULL)
@@ -1294,9 +1511,8 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
         if (obj_type != DWG_R1314_TYPE_LINE && obj_type != DWG_R1314_TYPE_CIRCLE &&
             obj_type != DWG_R1314_TYPE_ARC && obj_type != DWG_R1314_TYPE_POINT &&
             obj_type != DWG_R1314_TYPE_TEXT && obj_type != DWG_R1314_TYPE_POLYLINE2D &&
-            obj_type != DWG_R1314_TYPE_SOLID && obj_type != DWG_R1314_TYPE_INSERT &&
-            obj_type != DWG_R1314_TYPE_ELLIPSE)
-            continue;
+            obj_type != DWG_R1314_TYPE_SOLID && obj_type != DWG_R1314_TYPE_INSERT)
+            continue; /* not modeled (or, for a stale map entry, not a real object at all) */
 
         if (!read_common_entity_data_r1314(&bs, &common))
             continue;
@@ -1306,7 +1522,6 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
         case DWG_R1314_TYPE_LINE:   e = decode_line_r1314(hDwg, &bs);   break;
         case DWG_R1314_TYPE_CIRCLE: e = decode_circle_r1314(hDwg, &bs); break;
         case DWG_R1314_TYPE_ARC:    e = decode_arc_r1314(hDwg, &bs);    break;
-        case DWG_R1314_TYPE_ELLIPSE: e = decode_ellipse_r1314(hDwg, &bs); break;
         case DWG_R1314_TYPE_POINT:  e = decode_point_r1314(hDwg, &bs);  break;
         case DWG_R1314_TYPE_SOLID:  e = decode_solid_r1314(hDwg, &bs);  break;
         case DWG_R1314_TYPE_TEXT:   e = decode_text_r1314(hDwg, &bs);   break;
@@ -1341,24 +1556,6 @@ HDWG dwg_read_dwg_r1314(const char *path, DWG_IO_RESULT *result)
                    BYLAYER, resolve the real color from the layer instead. */
                 if (common.color == 0U || common.color == 256U)
                     apply_color(e, layer_color);
-            }
-
-            /* Resolve STYLE handle for TEXT entities -- the STYLE handle
-               sits right after the LAYER handle in R13-R14 handle order. */
-            if (obj_type == DWG_R1314_TYPE_TEXT)
-            {
-                unsigned char hcode;
-                unsigned long hval, style_handle, style_loc;
-                char style_name[256];
-
-                dwg_bs_read_handle(&bs, &hcode, &style_handle);
-                if (objmap_find(&objmap, style_handle, &style_loc) &&
-                    style_loc + 6UL < length &&
-                    decode_table_record_name_r1314(data, length, style_loc, DWG_R1314_TYPE_STYLE, style_name, sizeof(style_name), NULL))
-                {
-                    dwg_text_set_style_name(e, style_name);
-                }
-                (void)hval;
             }
         }
     }

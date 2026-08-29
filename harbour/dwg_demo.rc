@@ -1,0 +1,128 @@
+// dwg_demo.rc
+//
+// ============================================================================
+// Los 4 dialogos de TDwgViewer como recursos DIALOGEX reales (pedido de
+// Arturo 2026-08-27, "generar un dwg_demo.rc donde se encuentren todos
+// los dialogos y reemplazarlos") -- antes se construian 100% por codigo
+// (@ ROW,COL ... PIXEL, coordenadas calculadas a mano), la causa real
+// del bug de "GETs gigantes" que hubo que corregir con un font
+// explicito mas temprano en la sesion. En DIALOG UNITS (no pixeles),
+// Windows los escala solo segun el font/DPI real del sistema -- mismo
+// patron que customer_rc.rc/customer_rc.prg de FWH2603
+// (samples\test\), el unico ejemplo real+probado (con captura de
+// pantalla) de DEFINE DIALOG RESOURCE + REDEFINE en todo el toolchain.
+//
+// Los numeros de ID vienen de dwg_demo_ids.ch, compartido con cada .prg
+// que hace REDEFINE de estos controles -- una sola fuente de verdad.
+// ============================================================================
+
+#include <windows.h>
+#include "dwg_demo_ids.ch"
+
+// ----------------------------------------------------------------------------
+// CAPAS (dwg_layers_dlg.prg) -- 1 SAY fijo, 1 LISTBOX multi-seleccion
+// (LBS_MULTIPLESEL horneado aca -- un recurso ya cargado no acepta la
+// clausula MULTIPLE del lado .prg, el estilo tiene que venir en la
+// plantilla), 3 BUTTON.
+// ----------------------------------------------------------------------------
+CAPAS DIALOGEX 0, 0, 200, 150
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Capas"
+FONT 9, "Segoe UI"
+BEGIN
+  LTEXT    "Resaltadas = visibles", -1, 7, 7, 180, 8
+  LISTBOX  ID_CAPAS_LIST, 7, 20, 186, 95, LBS_MULTIPLESEL | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | WS_BORDER
+  PUSHBUTTON     "Aislar",         ID_CAPAS_ISOLATE,  7, 122, 55, 14
+  PUSHBUTTON     "Mostrar todas",  ID_CAPAS_SHOWALL, 68, 122, 65, 14
+  PUSHBUTTON     "Cerrar",         IDCANCEL,         139, 122, 54, 14
+END
+
+// ----------------------------------------------------------------------------
+// PROPIEDADES (dwg_props_dlg.prg) -- 3 SAY+GET fijos (Capa/Color/
+// Linetype), 1 SAY de encabezado ("Geometria:"/"sin geometria
+// editable"), 6 pares SAY+GET de geometria (las etiquetas se rellenan
+// en runtime segun el tipo de entidad -- ver dwg_props_dlg.prg, mismo
+// mecanismo que ya tenia), 1 par SAY+GET de texto (solo visible para
+// TEXT), 2 BUTTON.
+// ----------------------------------------------------------------------------
+PROPIEDADES DIALOGEX 0, 0, 200, 235
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Propiedades"
+FONT 9, "Segoe UI"
+BEGIN
+  LTEXT     "Capa",      -1, 7, 9, 40, 8
+  EDITTEXT      ID_PROPS_CAPA,      55,  7, 138, 14, ES_AUTOHSCROLL
+  LTEXT     "Color ACI", -1, 7, 27, 40, 8
+  EDITTEXT      ID_PROPS_COLOR,     55, 25,  50, 14, ES_AUTOHSCROLL
+  LTEXT     "Linetype",  -1, 7, 45, 40, 8
+  EDITTEXT      ID_PROPS_LINETYPE,  55, 43, 138, 14, ES_AUTOHSCROLL
+
+  LTEXT     "Geometria:", ID_PROPS_GEOMLABEL, 7, 63, 186, 8
+
+  LTEXT     "", ID_PROPS_LBL1, 7,  79, 40, 8
+  EDITTEXT      ID_PROPS_G1,      55,  77, 90, 14, ES_AUTOHSCROLL
+  LTEXT     "", ID_PROPS_LBL2, 7,  97, 40, 8
+  EDITTEXT      ID_PROPS_G2,      55,  95, 90, 14, ES_AUTOHSCROLL
+  LTEXT     "", ID_PROPS_LBL3, 7, 115, 40, 8
+  EDITTEXT      ID_PROPS_G3,      55, 113, 90, 14, ES_AUTOHSCROLL
+  LTEXT     "", ID_PROPS_LBL4, 7, 133, 40, 8
+  EDITTEXT      ID_PROPS_G4,      55, 131, 90, 14, ES_AUTOHSCROLL
+  LTEXT     "", ID_PROPS_LBL5, 7, 151, 40, 8
+  EDITTEXT      ID_PROPS_G5,      55, 149, 90, 14, ES_AUTOHSCROLL
+  LTEXT     "", ID_PROPS_LBL6, 7, 169, 40, 8
+  EDITTEXT      ID_PROPS_G6,      55, 167, 90, 14, ES_AUTOHSCROLL
+
+  LTEXT     "", ID_PROPS_LBLTXT, 7, 187, 40, 8
+  EDITTEXT      ID_PROPS_TEXTO,   55, 185, 138, 14, ES_AUTOHSCROLL
+
+  DEFPUSHBUTTON  "Aceptar",  IDOK,      7, 213, 68, 14
+  PUSHBUTTON     "Cancelar", IDCANCEL, 80, 213, 68, 14
+END
+
+// ----------------------------------------------------------------------------
+// TEXTO (dwg_text_dlg.prg) -- 1 SAY+GET (contenido), 1 SAY + LISTBOX
+// (fuentes instaladas, llenada en runtime via EnumFontFamilies -- el
+// LISTBOX arranca vacio en la plantilla, ITEMS se pasa en el REDEFINE),
+// 1 SAY+GET (tamaño), 2 BUTTON.
+// ----------------------------------------------------------------------------
+TEXTO DIALOGEX 0, 0, 200, 210
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Texto"
+FONT 9, "Segoe UI"
+BEGIN
+  LTEXT     "Texto", -1, 7, 9, 40, 8
+  EDITTEXT      ID_TEXT_TEXTO, 50, 7, 143, 14, ES_AUTOHSCROLL
+
+  LTEXT     "Fuente (instaladas en Windows)", ID_TEXT_FONTSLABEL, 7, 27, 186, 8
+  LISTBOX   ID_TEXT_FONTS, 7, 40, 186, 118, LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | WS_BORDER
+
+  LTEXT     "Tamaño", -1, 7, 165, 40, 8
+  EDITTEXT      ID_TEXT_ALTURA, 50, 163, 60, 14, ES_AUTOHSCROLL
+
+  DEFPUSHBUTTON  "Aceptar",  IDOK,      7, 187, 68, 14
+  PUSHBUTTON     "Cancelar", IDCANCEL, 80, 187, 68, 14
+END
+
+// ----------------------------------------------------------------------------
+// PARAMETROS (dwg_demo.prg, DwgAskParams) -- dialogo generico reusado
+// por Mover/Rotar/Escalar/Espejar/Copiar/Unir, hasta 4 pares SAY+GET
+// (titulo Y etiquetas se rellenan en runtime segun la operacion -- ver
+// dwg_demo.prg), 2 BUTTON.
+// ----------------------------------------------------------------------------
+PARAMETROS DIALOGEX 0, 0, 180, 110
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Parametros"
+FONT 9, "Segoe UI"
+BEGIN
+  LTEXT     "", ID_PARAMS_LBL1, 7,  9, 35, 8
+  EDITTEXT      ID_PARAMS_F1,   48,  7, 100, 14, ES_AUTOHSCROLL
+  LTEXT     "", ID_PARAMS_LBL2, 7, 27, 35, 8
+  EDITTEXT      ID_PARAMS_F2,   48, 25, 100, 14, ES_AUTOHSCROLL
+  LTEXT     "", ID_PARAMS_LBL3, 7, 45, 35, 8
+  EDITTEXT      ID_PARAMS_F3,   48, 43, 100, 14, ES_AUTOHSCROLL
+  LTEXT     "", ID_PARAMS_LBL4, 7, 63, 35, 8
+  EDITTEXT      ID_PARAMS_F4,   48, 61, 100, 14, ES_AUTOHSCROLL
+
+  DEFPUSHBUTTON  "Aceptar",  IDOK,      7, 85, 68, 14
+  PUSHBUTTON     "Cancelar", IDCANCEL, 80, 85, 68, 14
+END

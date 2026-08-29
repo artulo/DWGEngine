@@ -33,13 +33,6 @@ DWG_IO_RESULT dwg_write_dxf(HDWG hDwg, const char *path);
 DWG_IO_RESULT dwg_write_dwg_r12(HDWG hDwg, const char *path);
 HDWG dwg_read_dwg_r12(const char *path, DWG_IO_RESULT *result);
 
-/*
- * Reads an entire file into a malloc'd buffer. Caller must free()
- * the returned pointer. Returns NULL on failure (file not found,
- * read error, or OOM). *out_length receives the file size in bytes.
- */
-unsigned char *dwg_read_whole_file(const char *path, unsigned long *out_length);
-
 #ifdef __cplusplus
 }
 #endif
