@@ -154,6 +154,20 @@ if errorlevel 1 GOTO COMPILEERRORS_TEXT_DLG
 cl.exe /c /nologo /O2 /W0 /D_CRT_SECURE_NO_WARNINGS /I%hdir%\include /I%fwh%\include /Fo.\ dwg_text_dlg.c
 if not exist dwg_text_dlg.obj GOTO ENGINEERROR
 
+REM --- 3e) dwg_pdf_dlg.prg (opciones de Exportar a PDF: area/papel/orientacion/
+REM color, ver TDwgViewer:ExportPdf en dwg_viewer.prg y el recurso
+REM EXPORTPDF de dwg_demo.rc) -- mismo patron que dwg_text_dlg.prg arriba.
+ECHO === Compilando dwg_pdf_dlg.prg ===
+copy %ENGABS%\harbour\dwg_pdf_dlg.prg . > nul
+
+%hbin%\harbour.exe dwg_pdf_dlg /n /i%fwh%\include;%hdir%\include /w /p > comp_pdf_dlg.log 2> warnings_pdf_dlg.log
+if errorlevel 1 GOTO COMPILEERRORS_PDF_DLG
+@type comp_pdf_dlg.log
+@type warnings_pdf_dlg.log
+
+cl.exe /c /nologo /O2 /W0 /D_CRT_SECURE_NO_WARNINGS /I%hdir%\include /I%fwh%\include /Fo.\ dwg_pdf_dlg.c
+if not exist dwg_pdf_dlg.obj GOTO ENGINEERROR
+
 REM --- 4) dwg_demo.prg -----------------------------------------------------
 copy %ENGABS%\harbour\%PRG%.prg . > nul
 
@@ -187,13 +201,13 @@ link.exe /nologo /subsystem:windows /out:%PRG%.exe ^
     dwg_bitstream.obj dwg_block.obj dwg_dimension.obj dwg_dimstyle.obj dwg_document.obj ^
     dwg_dwg_reader.obj dwg_dwg_writer.obj dwg_dxf_reader.obj dwg_dxf_writer.obj ^
     dwg_entity.obj dwg_geometry.obj dwg_hatch.obj dwg_insert.obj dwg_layer.obj ^
-    dwg_leader.obj dwg_linetype.obj dwg_mlinestyle.obj dwg_mtext.obj dwg_page.obj ^
+    dwg_leader.obj dwg_linetype.obj dwg_mlinestyle.obj dwg_mtext.obj dwg_page.obj dwg_pdf_export.obj ^
     dwg_pointstyle.obj dwg_polyline.obj dwg_r2000_entity_reader.obj ^
     dwg_r2000_reader.obj dwg_r2000_writer.obj dwg_r1314_entity_reader.obj ^
     dwg_r2004_decompress.obj dwg_r2004_entity_reader.obj dwg_render.obj ^
     dwg_selection.obj dwg_solid.obj dwg_style.obj dwg_text.obj dwg_transform.obj ^
     dwg_vertex.obj dwg_libredwg_bridge.obj dwg_hbfunc.obj dwg_viewer.obj ^
-    dwg_layers_dlg.obj dwg_props_dlg.obj dwg_text_dlg.obj %PRG%.obj ^
+    dwg_layers_dlg.obj dwg_props_dlg.obj dwg_text_dlg.obj dwg_pdf_dlg.obj %PRG%.obj ^
     dwg_demo.res ^
     "%LIBREDWG%\build_msvc\libredwg.dir\Release\bits.obj" ^
     "%LIBREDWG%\build_msvc\libredwg.dir\Release\classes.obj" ^
@@ -260,6 +274,12 @@ GOTO EXIT
 @type comp_text_dlg.log
 @type warnings_text_dlg.log
 ECHO * Errores de compilacion Harbour (dwg_text_dlg.prg) *
+GOTO EXIT
+
+:COMPILEERRORS_PDF_DLG
+@type comp_pdf_dlg.log
+@type warnings_pdf_dlg.log
+ECHO * Errores de compilacion Harbour (dwg_pdf_dlg.prg) *
 GOTO EXIT
 
 :COMPILEERRORS

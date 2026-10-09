@@ -65,4 +65,18 @@
 #define ID_PARAMS_F3    407
 #define ID_PARAMS_F4    408
 
+// ---- Exportar a PDF (dwg_pdf_dlg.prg) --------------------------------
+// Cada grupo de radios son 3 IDs CONSECUTIVOS (REDEFINE RADIO los toma
+// en orden, el valor de la variable es el indice 1..3).
+#define ID_PDF_AREA1    501   // Todo el dibujo
+#define ID_PDF_AREA2    502   // Vista actual (lo que se ve en pantalla)
+#define ID_PDF_AREA3    503   // Elegir en pantalla (dos esquinas)
+#define ID_PDF_PAPER1   511   // A4
+#define ID_PDF_PAPER2   512   // A3
+#define ID_PDF_PAPER3   513   // A2
+#define ID_PDF_ORIENT1  521   // Automatica
+#define ID_PDF_ORIENT2  522   // Vertical
+#define ID_PDF_ORIENT3  523   // Apaisada
+#define ID_PDF_COLOR    531
+
 #endif

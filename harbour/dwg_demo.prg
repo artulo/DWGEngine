@@ -193,6 +193,13 @@ MENU oMenu
 				( cDwg := oDwg:cFile, oWnd:cTitle := "DWGEngine - " + cDwg ), NIL ), ;
 				oWnd:Refresh() )
 
+			// Exportar a PDF (pedido de Arturo 2026-10-08, "quiero un proceso
+			// para llevar un dwg a pdf") -- ver TDwgViewer:ExportPdf.
+			// El dialogo (dwg_pdf_dlg.prg) pide area (todo/vista actual/
+			// elegir en pantalla), papel, orientacion y color.
+			MENUITEM "Exportar a PDF..." ;
+				ACTION ( oDwg:ExportPdf() )
+
 			MENUITEM"Ajustar" ;
 				ACTION ( oDwg:ZoomFit() )
 

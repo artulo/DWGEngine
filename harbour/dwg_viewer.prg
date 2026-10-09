@@ -787,6 +787,9 @@ CLASS TDwgViewer
    METHOD Save()                       // sobreescribe ::cFile (o redirige a SaveAs si todavia no hay archivo). .T./.F.
    METHOD SaveAs()                     // pide un archivo nuevo (dialogo "Guardar como") y escribe ahi. .T./.F.
    METHOD WriteTo( cPath )             // escribe ::pDoc en cPath, formato segun la extension. .T./.F.
+   METHOD ExportPdf()                  // dialogo de opciones (area/papel/orientacion/color) y exporta a PDF vectorial via "Microsoft Print to PDF". .T./.F.
+   METHOD DoExportPdf( aOpts, aArea )  // pide el archivo y escribe el PDF -- aArea NIL = todo, o { x1,y1,x2,y2 } de mundo. .T./.F.
+   DATA aPdfOpts         INIT NIL      // ultimas opciones elegidas en el dialogo (ver DwgPdfDlg) -- precargan la proxima vez y viajan al modo PRINTAREA
 
    METHOD Resize( nWidth, nHeight )
 
@@ -986,6 +989,96 @@ METHOD SaveAs() CLASS TDwgViewer
    ::cFile := cPath
 
 return .T.
+
+//----------------------------------------------------------------------------//
+
+// Exportar a PDF (pedido de Arturo 2026-10-08, "quiero un proceso para
+// llevar un dwg a pdf", y "al imprimir me permita elegir el area que
+// deseo") -- ver dwg_pdf_export.h para el camino (el mismo renderizador
+// de pantalla sobre la impresora virtual "Microsoft Print to PDF",
+// vector, con auto-ajuste a la hoja). Abre el dialogo de opciones
+// (dwg_pdf_dlg.prg: area, papel, orientacion, color; precargado con lo
+// ultimo que se uso, ::aPdfOpts). Area "todo el dibujo" / "vista actual"
+// exportan de inmediato; "elegir en pantalla" entra en modo PRINTAREA
+// (dos clicks marcan las esquinas, igual que RECT con preview XOR) y la
+// exportacion sigue desde TDwgViewer:DrawClick al segundo click.
+METHOD ExportPdf() CLASS TDwgViewer
+
+   local aOpts, aRect, nW, nH, aArea := NIL
+
+   if ::pDoc == NIL
+      return .F.
+   endif
+
+   aOpts := DwgPdfDlg( ::aPdfOpts )
+   if aOpts == NIL
+      return .F.
+   endif
+   ::aPdfOpts := aOpts
+
+   do case
+   case aOpts[ 1 ] == 2         // vista actual: el rectangulo de MUNDO que hoy muestra el lienzo
+      aRect := GetClientRect( ::oBmp:hWnd )
+      nW    := aRect[ 4 ] - aRect[ 2 ]
+      nH    := aRect[ 3 ] - aRect[ 1 ]
+      aArea := { ::nOriginX, ::nOriginY - nH * ::nScale, ;
+                 ::nOriginX + nW * ::nScale, ::nOriginY }
+
+   case aOpts[ 1 ] == 3         // elegir en pantalla: los dos clicks completan el flujo (DrawClick)
+      ::StartDraw( "PRINTAREA" )
+      MsgInfo( "Marque con dos clicks las esquinas opuestas del area a exportar." + ;
+               Chr( 13 ) + Chr( 10 ) + "ESC cancela.", "Exportar a PDF" )
+      return .F.
+   endcase
+
+return ::DoExportPdf( aOpts, aArea )
+
+//----------------------------------------------------------------------------//
+
+// Pide el archivo de salida, exporta (aArea NIL = todo el dibujo, o
+// { x1, y1, x2, y2 } de MUNDO) y avisa el resultado. aOpts: ver
+// DwgPdfDlg. Tarda unos segundos en dibujos grandes (el spooler escribe
+// el archivo de forma asincrona -- la espera esta del lado C). .T. si
+// quedo el PDF.
+METHOD DoExportPdf( aOpts, aArea ) CLASS TDwgViewer
+
+   local cPath, nRc, cMsg
+   local cEol := Chr( 13 ) + Chr( 10 )
+
+   cPath := cGetFile( "Archivos PDF|*.pdf", "Exportar a PDF", NIL, NIL, .T. )
+   if Empty( cPath )
+      return .F.
+   endif
+   if Empty( hb_FNameExt( cPath ) )
+      cPath += ".pdf"
+   endif
+
+   CursorWait()
+   nRc := Dwg_ExportPdf( ::pDoc, cPath, aOpts[ 2 ], aOpts[ 3 ], !aOpts[ 4 ], 10, NIL, aArea )
+   CursorArrow()
+
+   do case
+   case nRc == 0
+      if MsgYesNo( "PDF generado:" + cEol + cPath + cEol + cEol + "Abrirlo ahora?", "Exportar a PDF" )
+         ShellExecute( 0, "open", cPath )
+      endif
+      return .T.
+   case nRc == -2
+      cMsg := "El dibujo no tiene nada para exportar."
+   case nRc == -3
+      cMsg := "No se encontro la impresora virtual 'Microsoft Print to PDF'." + cEol + ;
+              "Activala en Windows (Caracteristicas opcionales > Microsoft Print to PDF)."
+   case nRc == -4
+      cMsg := "No se pudo escribir el PDF." + cEol + "Revisa la ruta, y que no este abierto en otro programa."
+   case nRc == -5
+      cMsg := "El PDF no termino de generarse a tiempo."
+   otherwise
+      cMsg := "Error al exportar a PDF (codigo " + LTrim( Str( nRc ) ) + ")."
+   endcase
+
+   MsgStop( cMsg, "Exportar a PDF" )
+
+return .F.
 
 //----------------------------------------------------------------------------//
 
@@ -1466,6 +1559,24 @@ METHOD DrawClick( nWx, nWy ) CLASS TDwgViewer
          ::FinishEntity( pEnt )
       endif
 
+   case ::cDrawMode == "PRINTAREA"
+      // Elegir el area a exportar a PDF (ver ExportPdf): igual que RECT
+      // -- dos esquinas -- pero en vez de crear una entidad, sale del
+      // modo (una exportacion por area, no repetible como un comando de
+      // dibujo) y sigue con DoExportPdf. Dos clicks en el MISMO punto
+      // dan un area de ancho cero: se avisa en vez de intentar exportar.
+      if Len( ::aDrawPoints ) == 0
+         AAdd( ::aDrawPoints, { nWx, nWy } )
+      else
+         aCorners := { ::aDrawPoints[ 1 ][ 1 ], ::aDrawPoints[ 1 ][ 2 ], nWx, nWy }
+         ::CancelDraw()
+         if Abs( aCorners[ 3 ] - aCorners[ 1 ] ) < 0.000000001 .or. Abs( aCorners[ 4 ] - aCorners[ 2 ] ) < 0.000000001
+            MsgStop( "El area marcada no tiene tamano. Marque dos esquinas opuestas distintas.", "Exportar a PDF" )
+         else
+            ::DoExportPdf( ::aPdfOpts, aCorners )
+         endif
+      endif
+
    case ::cDrawMode == "ARC"
       // 3 puntos: centro, un punto que fija radio+angulo inicial, un
       // punto que fija el angulo final (mismo radio) -- simplificacion
@@ -1594,7 +1705,7 @@ METHOD GetDrawPreview( nWxCursor, nWyCursor ) CLASS TDwgViewer
    case ::cDrawMode == "LINE"
       return { { { ::aDrawPoints[ 1 ][ 1 ], ::aDrawPoints[ 1 ][ 2 ] }, { nWxCursor, nWyCursor } }, .F. }
 
-   case ::cDrawMode == "RECT"
+   case ::cDrawMode == "RECT" .or. ::cDrawMode == "PRINTAREA"
       return { DwgRectCorners( ::aDrawPoints[ 1 ][ 1 ], ::aDrawPoints[ 1 ][ 2 ], nWxCursor, nWyCursor ), .T. }
 
    case ::cDrawMode == "CIRCLE" .or. ( ::cDrawMode == "ARC" .and. Len( ::aDrawPoints ) == 1 )

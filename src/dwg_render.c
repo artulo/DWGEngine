@@ -39,6 +39,8 @@ typedef struct
     HBRUSH brush;
     unsigned short brush_color;
     int brush_valid;
+    unsigned long flags; /* DWG_RENDER_FLAG_* (dwg_render.h) -- 0 = pantalla de siempre */
+    int pen_width;       /* ancho de lapiz en pixeles de dispositivo (1 en pantalla) */
     HDWG hDwg; /* pedido de Arturo 2026-08-26 ("agregar funcion para escribir texto
                   definiendo el tipo de letra y tamaño") -- resolve_text_font
                   necesita el documento para buscar el STYLE real de cada TEXT,
@@ -172,6 +174,26 @@ static COLORREF aci_to_colorref(unsigned short aci)
     return ensure_min_brightness(aci_to_colorref_raw(aci));
 }
 
+/* Color final de un ACI segun el modo del contexto. Pantalla: igual que
+   siempre. Impresion (DWG_RENDER_FLAG_PRINT, papel blanco): el ACI 7 es
+   "blanco o negro segun el fondo" en la convencion de AutoCAD -> negro
+   sobre papel; el resto de la paleta se usa tal cual SIN el piso de
+   brillo (ensure_min_brightness existe solo para que nada desaparezca
+   contra el fondo OSCURO de pantalla). Con DWG_RENDER_FLAG_MONO todo va
+   en negro (el "plot" monocromo por defecto de cualquier CAD). */
+static COLORREF resolve_color(const DWG_RENDER_CTX *rc, unsigned short aci)
+{
+    if (rc->flags & DWG_RENDER_FLAG_PRINT)
+    {
+        if (rc->flags & DWG_RENDER_FLAG_MONO)
+            return RGB(0, 0, 0);
+        if (aci == 7 || aci == 0 || aci == 256 || aci >= 250)
+            return RGB(0, 0, 0);
+        return aci_to_colorref_raw(aci);
+    }
+    return aci_to_colorref(aci);
+}
+
 static void set_pen_for_color(DWG_RENDER_CTX *rc, unsigned short color)
 {
     HPEN new_pen;
@@ -179,9 +201,9 @@ static void set_pen_for_color(DWG_RENDER_CTX *rc, unsigned short color)
     if (rc->pen_valid && rc->pen_color == color)
         return; /* same as last entity -- very common, drawings are grouped by layer/color -- skip the churn */
 
-    new_pen = CreatePen(PS_SOLID, 1, aci_to_colorref(color));
+    new_pen = CreatePen(PS_SOLID, rc->pen_width > 1 ? rc->pen_width : 1, resolve_color(rc, color));
     SelectObject(rc->hdc, new_pen);
-    SetTextColor(rc->hdc, aci_to_colorref(color));
+    SetTextColor(rc->hdc, resolve_color(rc, color));
 
     if (rc->pen_valid)
         DeleteObject(rc->pen);
@@ -202,7 +224,7 @@ static void set_brush_for_color(DWG_RENDER_CTX *rc, unsigned short color)
     if (rc->brush_valid && rc->brush_color == color)
         return;
 
-    new_brush = CreateSolidBrush(aci_to_colorref(color));
+    new_brush = CreateSolidBrush(resolve_color(rc, color));
     SelectObject(rc->hdc, new_brush);
 
     if (rc->brush_valid)
@@ -861,6 +883,15 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
                        double scale, double origin_x, double origin_y,
                        const DWG_CAMERA3D *camera)
 {
+    dwg_render_to_hdc_ex(hDwg, hdc_v, width, height, scale, origin_x, origin_y,
+                         camera, 0UL, 1);
+}
+
+void dwg_render_to_hdc_ex(HDWG hDwg, void *hdc_v, long width, long height,
+                          double scale, double origin_x, double origin_y,
+                          const DWG_CAMERA3D *camera,
+                          unsigned long flags, int pen_width)
+{
     HDC hdc = (HDC)hdc_v;
     DWG_RENDER_CTX rc;
     HENTITY e;
@@ -873,7 +904,7 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
         return;
 
     r.left = 0; r.top = 0; r.right = (LONG)width; r.bottom = (LONG)height;
-    bg_brush = CreateSolidBrush((COLORREF)DWG_RENDER_BG_COLOR);
+    bg_brush = CreateSolidBrush((flags & DWG_RENDER_FLAG_PRINT) ? RGB(255, 255, 255) : (COLORREF)DWG_RENDER_BG_COLOR);
     FillRect(hdc, &r, bg_brush);
     DeleteObject(bg_brush);
 
@@ -883,6 +914,8 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
     rc.origin_y = origin_y;
     rc.camera = camera;
     rc.hDwg = hDwg;
+    rc.flags = flags;
+    rc.pen_width = pen_width;
     rc.pen_valid = 0;
     rc.pen_color = 0;
     rc.pen = NULL;
@@ -896,7 +929,7 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
        per-entity color existed. */
     old_pen = (HPEN)SelectObject(hdc, GetStockObject(WHITE_PEN));
     old_brush = (HBRUSH)SelectObject(hdc, GetStockObject(WHITE_BRUSH));
-    SetTextColor(hdc, RGB(255, 255, 255));
+    SetTextColor(hdc, (flags & DWG_RENDER_FLAG_PRINT) ? RGB(0, 0, 0) : RGB(255, 255, 255));
 
     /* REVERTIDO 2026-08-26: un relleno con ordenamiento pintor (segunda
        pasada de SOLID/FACE ordenada por profundidad de camara, con
@@ -921,7 +954,7 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc_v, long width, long height,
         /* seleccion actual (dwg_document_sel_contains) se resalta con un
            color fijo en vez del real de la entidad -- ver
            DWG_RENDER_SELECTED_PSEUDO_COLOR arriba */
-        color = dwg_document_sel_contains(hDwg, e) ? DWG_RENDER_SELECTED_PSEUDO_COLOR : dwg_entity_get_color(e);
+        color = (!(flags & DWG_RENDER_FLAG_PRINT) && dwg_document_sel_contains(hDwg, e)) ? DWG_RENDER_SELECTED_PSEUDO_COLOR : dwg_entity_get_color(e);
         set_pen_for_color(&rc, color);
 
         switch (dwg_entity_get_type(e))

@@ -131,6 +131,16 @@
  * DWG_TEXTSETSTYLE resuelve-o-crea el DWG_STYLE tal cual DWG_ADDTEXT
  * (misma logica, factorizada en dwg_hb_apply_text_style de abajo).
  *
+ * Exportar a PDF (pedido de Arturo 2026-10-08, "quiero un proceso para
+ * llevar un dwg a pdf") -- el renderizador de pantalla dibuja sobre la
+ * impresora virtual "Microsoft Print to PDF" (ver dwg_pdf_export.h):
+ *
+ *   DWG_EXPORTPDF( pDoc, cPath, nPaper, nOrient, lMono, nMarginMm,
+ *                  cPrinter, aArea )                    -> nCodigo (0 = ok)
+ *
+ * aArea (NIL = todo el dibujo, o { x1,y1,x2,y2 } de mundo) -- pedido de
+ * Arturo 2026-10-08, "al imprimir me permita elegir el area".
+ *
  * DWG_OPEN prueba R2000 primero, R12 si eso falla -- cubre la mayoria
  * de archivos reales sin que el llamador tenga que saber la version de
  * antemano.
@@ -179,6 +189,7 @@
 #include "dwg_r2000_writer.h"
 #include "dwg_dimension.h"
 #include "dwg_style.h"
+#include "dwg_pdf_export.h"
 
 /* DWGENGINE_HAVE_LIBREDWG: definido SOLO por win32\BuildMSVC.bat -- el
  * build bcc32 (win32\Build.bat) no compila dwg_libredwg_bridge.c (LibreDWG
@@ -1165,4 +1176,45 @@ HB_FUNC(DWG_TEXTSETSTYLE)
 
     dwg_hb_apply_text_style(h->hDwg, e, font);
     hb_retl(HB_TRUE);
+}
+
+/* Exportar a PDF (pedido de Arturo 2026-10-08, "quiero un proceso para
+   llevar un dwg a pdf") -- wrapper de dwg_export_pdf (src\dwg_pdf_export.c,
+   ver dwg_pdf_export.h para el camino elegido y los codigos de retorno).
+   Bloquea hasta que el PDF esta completo en disco (el spooler lo escribe
+   unos segundos DESPUES de terminar de imprimir; la espera vive en
+   dwg_export_pdf, no aca).
+
+   DWG_EXPORTPDF( pDoc, cPath, nPaper, nOrient, lMono, nMarginMm,
+                  cPrinter, aArea ) -> nCodigo (0 = ok, negativo = error)
+   nPaper: 0=default de la impresora, 9=A4, 8=A3, 66=A2.
+   nOrient: 0=auto segun el dibujo, 1=vertical, 2=apaisado.
+   cPrinter NIL/"" = "Microsoft Print to PDF".
+   aArea NIL = todo el dibujo; { x1, y1, x2, y2 } (mundo) = solo esa
+   ventana, recortada y escalada para llenar la hoja. */
+HB_FUNC(DWG_EXPORTPDF)
+{
+    dwg_hb_doc *h = (dwg_hb_doc *)hb_parptr(1);
+    double area[4];
+    const double *pArea = NULL;
+
+    if (h == NULL || !h->open || hb_parc(2) == NULL)
+    {
+        hb_retnl(DWG_PDF_ERR_ARGS);
+        return;
+    }
+
+    if (HB_ISARRAY(8) && hb_arrayLen(hb_param(8, HB_IT_ARRAY)) >= 4)
+    {
+        PHB_ITEM pa = hb_param(8, HB_IT_ARRAY);
+        area[0] = hb_arrayGetND(pa, 1);
+        area[1] = hb_arrayGetND(pa, 2);
+        area[2] = hb_arrayGetND(pa, 3);
+        area[3] = hb_arrayGetND(pa, 4);
+        pArea = area;
+    }
+
+    hb_retnl(dwg_export_pdf(h->hDwg, hb_parc(2), hb_parc(7),
+                            hb_parni(3), hb_parni(4), hb_parl(5) ? 1 : 0,
+                            HB_ISNUM(6) ? hb_parnd(6) : 10.0, pArea));
 }

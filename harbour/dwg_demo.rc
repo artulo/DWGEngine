@@ -126,3 +126,36 @@ BEGIN
   DEFPUSHBUTTON  "Aceptar",  IDOK,      7, 85, 68, 14
   PUSHBUTTON     "Cancelar", IDCANCEL, 80, 85, 68, 14
 END
+
+// ----------------------------------------------------------------------------
+// EXPORTPDF (dwg_pdf_dlg.prg) -- opciones de "Exportar a PDF" (pedido de
+// Arturo 2026-10-08, "al imprimir me permita elegir el area que deseo"):
+// area (todo / vista actual / elegir en pantalla), papel, orientacion y
+// color. Cada grupo de radios: el primero lleva WS_GROUP (abre el grupo),
+// los GROUPBOX tambien (cierran el grupo anterior).
+// ----------------------------------------------------------------------------
+EXPORTPDF DIALOGEX 0, 0, 200, 180
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Exportar a PDF"
+FONT 9, "Segoe UI"
+BEGIN
+  GROUPBOX         "Area a exportar", -1, 7, 7, 186, 56, WS_GROUP
+  AUTORADIOBUTTON  "Todo el dibujo", ID_PDF_AREA1, 15, 19, 170, 10, WS_GROUP | WS_TABSTOP
+  AUTORADIOBUTTON  "Vista actual (lo que se ve en pantalla)", ID_PDF_AREA2, 15, 31, 170, 10
+  AUTORADIOBUTTON  "Elegir en pantalla (marcar dos esquinas)", ID_PDF_AREA3, 15, 43, 170, 10
+
+  GROUPBOX         "Papel", -1, 7, 69, 186, 28, WS_GROUP
+  AUTORADIOBUTTON  "A4", ID_PDF_PAPER1, 15, 81, 40, 10, WS_GROUP | WS_TABSTOP
+  AUTORADIOBUTTON  "A3", ID_PDF_PAPER2, 65, 81, 40, 10
+  AUTORADIOBUTTON  "A2", ID_PDF_PAPER3, 115, 81, 40, 10
+
+  GROUPBOX         "Orientacion", -1, 7, 101, 186, 28, WS_GROUP
+  AUTORADIOBUTTON  "Automatica", ID_PDF_ORIENT1, 15, 113, 55, 10, WS_GROUP | WS_TABSTOP
+  AUTORADIOBUTTON  "Vertical", ID_PDF_ORIENT2, 80, 113, 45, 10
+  AUTORADIOBUTTON  "Apaisada", ID_PDF_ORIENT3, 135, 113, 50, 10
+
+  AUTOCHECKBOX     "Con los colores del dibujo (sin marcar: todo en negro)", ID_PDF_COLOR, 7, 135, 186, 10, WS_GROUP | WS_TABSTOP
+
+  DEFPUSHBUTTON    "Exportar", IDOK, 40, 158, 55, 14, WS_GROUP
+  PUSHBUTTON       "Cancelar", IDCANCEL, 105, 158, 55, 14
+END

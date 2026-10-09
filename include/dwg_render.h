@@ -68,6 +68,27 @@ void dwg_render_to_hdc(HDWG hDwg, void *hdc, long width, long height,
                        const DWG_CAMERA3D *camera);
 
 /*
+ * Variante con modo de salida (exportar a PDF, pedido de Arturo
+ * 2026-10-08 "llevar un dwg a pdf"). Mismo dibujo, otro "medio":
+ *   DWG_RENDER_FLAG_PRINT: papel blanco en vez del fondo oscuro de
+ *     pantalla, ACI 7 (y BYLAYER/BYBLOCK sin resolver) en NEGRO, sin el
+ *     piso de brillo (que existe solo por el fondo oscuro) y sin el
+ *     resaltado magenta de la seleccion.
+ *   DWG_RENDER_FLAG_MONO (junto con PRINT): TODO en negro.
+ * pen_width: ancho de lapiz en pixeles de DISPOSITIVO -- 1 px en una
+ * impresora de 600 dpi es una linea casi invisible, quien llama lo
+ * calcula desde los dpi reales (ver dwg_pdf_export.c).
+ * dwg_render_to_hdc es exactamente esto con flags=0, pen_width=1.
+ */
+#define DWG_RENDER_FLAG_PRINT 0x0001UL
+#define DWG_RENDER_FLAG_MONO  0x0002UL
+
+void dwg_render_to_hdc_ex(HDWG hDwg, void *hdc, long width, long height,
+                          double scale, double origin_x, double origin_y,
+                          const DWG_CAMERA3D *camera,
+                          unsigned long flags, int pen_width);
+
+/*
  * World-space bounding box of every entity in hDwg (min/max over all
  * entities this renderer knows how to measure -- same type coverage as
  * dwg_render_to_hdc). Returns 0 (and leaves the outputs untouched) if
